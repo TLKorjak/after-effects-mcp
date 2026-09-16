@@ -190,7 +190,12 @@ server.tool(
       "setCompositionProperties",
       "duplicateLayer",
       "deleteLayer",
-      "setLayerMask"
+      "setLayerMask",
+      "getLayerExpressions",
+      "getExpressionErrors",
+      "addToEssentialGraphics",
+      "getEssentialGraphics",
+      "setEssentialGraphicsProperty"
     ];
     
     if (!allowedScripts.includes(script)) {
@@ -363,9 +368,20 @@ Available scripts:
 - createSolidLayer: Create a new solid layer
 - setLayerProperties: Set properties for a layer
 - setLayerKeyframe: Set a keyframe for a layer property
-- setLayerExpression: Set an expression for a layer property
+- setLayerExpression: Set, remove, and/or enable/disable an expression on a layer property
+- getLayerExpressions: List every expression-capable property on a layer with its current state
+- getExpressionErrors: Scan the project, a composition, or a layer for expression errors/disabled expressions
+- addToEssentialGraphics: Add a layer property (Checkbox/Color/Slider/Source Text) to the Essential Graphics panel
+- getEssentialGraphics: List a composition's Motion Graphics template name and exposed Essential Graphics properties
+- setEssentialGraphicsProperty: Rename an Essential Graphics entry and/or set the Motion Graphics template name
 - applyEffect: Apply an effect to a layer
 - applyEffectTemplate: Apply a predefined effect template to a layer
+- createCamera: Create a new camera layer
+- duplicateLayer: Duplicate a layer
+- deleteLayer: Delete a layer
+- setLayerMask: Add or edit a mask on a layer
+- batchSetLayerProperties: Set properties across multiple layers at once
+- setCompositionProperties: Change settings on an existing composition
 
 Effect Templates:
 - gaussian-blur: Simple Gaussian blur effect
@@ -484,17 +500,21 @@ server.tool(
 // Tool for setting a layer expression
 server.tool(
   "setLayerExpression", // Corresponds to the function name in ExtendScript
-  "Set or remove an expression for a specific layer property.",
+  "Set, remove, and/or enable/disable an expression on a specific layer property. " +
+  "propertyName is searched across the layer's whole property tree (transform, effects, text, masks, etc.), " +
+  "not just Transform - use propertyPath to disambiguate if more than one property could match.",
   {
     ...LayerIdentifierSchema, // Reuse common identifiers
-    propertyName: z.string().describe("Name of the property to apply the expression to (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
-    expressionString: z.string().describe("The JavaScript expression string. Provide an empty string (\"\") to remove the expression.")
+    propertyName: z.string().describe("Name or matchName of the property to target (e.g., 'Opacity', 'Blurriness', 'ADBE Position')."),
+    expressionString: z.string().optional().describe("The JavaScript expression string. Provide an empty string (\"\") to remove the expression. Omit to leave the current expression text untouched (e.g. when only toggling `enabled`)."),
+    propertyPath: z.array(z.string()).optional().describe("Exact path from the layer down to the property (e.g. ['Effects', 'Gaussian Blur', 'Blurriness']), to disambiguate when propertyName alone could match more than one property."),
+    enabled: z.boolean().optional().describe("Enable or disable the expression without changing its text.")
   },
   async (parameters) => {
     try {
       // Queue the command for After Effects
       writeCommandFile("setLayerExpression", parameters);
-      
+
       return {
         content: [
           {
@@ -518,7 +538,197 @@ server.tool(
   }
 );
 
-// --- END NEW TOOLS --- 
+// Tool for listing every expression-capable property on a layer, with current state
+server.tool(
+  "getLayerExpressions",
+  "List every expression-capable property on a layer (transform, effects, text, masks, etc.) along with its " +
+  "current expression text, enabled state, and expressionError if any. Use this to discover what can be targeted " +
+  "with setLayerExpression, or to check/fix an expression that's already applied.",
+  {
+    ...LayerIdentifierSchema
+  },
+  async (parameters) => {
+    try {
+      writeCommandFile("getLayerExpressions", parameters);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Command to list expressions on layer ${parameters.layerIndex} in comp ${parameters.compIndex} has been queued.\n` +
+                  `Use the "get-results" tool after a few seconds to check for results.`
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error queuing getLayerExpressions command: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool for scanning expression errors and disabled expressions
+server.tool(
+  "getExpressionErrors",
+  "Scan for expression errors and disabled expressions across the whole project, a single composition, " +
+  "or a single layer. Use scope 'project' for a broad audit, or 'comp'/'layer' to narrow down while fixing something specific.",
+  {
+    scope: z.enum(["project", "comp", "layer"]).default("project").describe("How broadly to scan."),
+    compIndex: z.number().int().positive().optional().describe("1-based composition index. Required for scope 'comp' or 'layer'."),
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index within the composition. Required for scope 'layer'.")
+  },
+  async (parameters) => {
+    try {
+      writeCommandFile("getExpressionErrors", parameters);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Command to scan expression errors (scope: ${parameters.scope}) has been queued.\n` +
+                  `Use the "get-results" tool after a few seconds to check for results.`
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error queuing getExpressionErrors command: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+// Zod schema for identifying a composition (Essential Graphics tools operate at the comp level)
+const CompIdentifierSchema = {
+  compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel.")
+};
+
+// Tool for adding a layer property to the Essential Graphics panel
+server.tool(
+  "addToEssentialGraphics",
+  "Add a layer property to the Essential Graphics panel for a composition. Only a Checkbox, Color, " +
+  "single-value numerical Slider (e.g. Opacity, Slider Control), or Source Text property can be added - " +
+  "check with the property first if unsure. There is no scripting API to remove an entry once added; " +
+  "that has to be done by hand in the panel.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name or matchName of the property to expose (e.g., 'Opacity', 'Source Text')."),
+    propertyPath: z.array(z.string()).optional().describe("Exact path from the layer down to the property, to disambiguate when propertyName alone could match more than one property."),
+    displayName: z.string().optional().describe("Custom name to show in the Essential Graphics panel. Omit to use the property's own name.")
+  },
+  async (parameters) => {
+    try {
+      writeCommandFile("addToEssentialGraphics", parameters);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Command to add "${parameters.propertyName}" on layer ${parameters.layerIndex} in comp ${parameters.compIndex} to Essential Graphics has been queued.\n` +
+                  `Use the "get-results" tool after a few seconds to check for confirmation.`
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error queuing addToEssentialGraphics command: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool for listing a composition's Essential Graphics panel contents
+server.tool(
+  "getEssentialGraphics",
+  "List the Motion Graphics template name and every property currently exposed in the Essential Graphics panel for a composition.",
+  {
+    ...CompIdentifierSchema
+  },
+  async (parameters) => {
+    try {
+      writeCommandFile("getEssentialGraphics", parameters);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Command to list Essential Graphics for comp ${parameters.compIndex} has been queued.\n` +
+                  `Use the "get-results" tool after a few seconds to check for results.`
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error queuing getEssentialGraphics command: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool for renaming an Essential Graphics entry and/or the Motion Graphics template name
+server.tool(
+  "setEssentialGraphicsProperty",
+  "Rename an existing Essential Graphics panel entry and/or set the composition's Motion Graphics " +
+  "template name (used as the exported .mogrt filename). Use getEssentialGraphics first to find a property's controllerIndex.",
+  {
+    ...CompIdentifierSchema,
+    controllerIndex: z.number().int().positive().optional().describe("1-based index (from getEssentialGraphics) of the Essential Graphics entry to rename. Provide together with newName."),
+    newName: z.string().optional().describe("New display name for the entry at controllerIndex."),
+    templateName: z.string().optional().describe("New Motion Graphics template (.mogrt) name for the composition.")
+  },
+  async (parameters) => {
+    try {
+      writeCommandFile("setEssentialGraphicsProperty", parameters);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Command to update Essential Graphics for comp ${parameters.compIndex} has been queued.\n` +
+                  `Use the "get-results" tool after a few seconds to check for confirmation.`
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error queuing setEssentialGraphicsProperty command: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+// --- END NEW TOOLS ---
 
 // --- BEGIN NEW TESTING TOOL --- 
 // Add a special tool for directly testing the keyframe functionality

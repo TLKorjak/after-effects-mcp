@@ -1,6 +1,12 @@
 // mcp-bridge-auto.jsx
 // Auto-running MCP Bridge panel for After Effects
 
+// $.fileName is a shared, mutable ExtendScript engine property -- it reflects whichever script
+// most recently started executing, anywhere in this AE session, not necessarily this one. Captured
+// once, right here, at the very top of this script's own execution, before anything else can
+// possibly run and overwrite it, so the reload link near the bottom always re-reads the right file.
+var THIS_SCRIPT_FILE = $.fileName;
+
 // Remove #include directives as we define functions below
 /*
 #include "createComposition.jsx"
@@ -802,68 +808,388 @@ function setLayerKeyframe(compIndex, layerIndex, propertyName, timeInSeconds, va
 }
 
 
+// --- Expression property resolution helpers ---
+
+// Shorthand names for the properties expressions are applied to most often.
+var EXPRESSION_PROPERTY_SHORTCUTS = {
+    "position": "ADBE Position",
+    "scale": "ADBE Scale",
+    "rotation": "ADBE Rotate Z",
+    "opacity": "ADBE Opacity",
+    "anchor point": "ADBE Anchor Point",
+    "anchorpoint": "ADBE Anchor Point"
+};
+
+// Recursively search a property group for a property matching by matchName or display name.
+function findPropertyInTree(group, name) {
+    for (var i = 1; i <= group.numProperties; i++) {
+        var prop = group.property(i);
+        if (prop.matchName === name || prop.name === name) return prop;
+        if (prop.propertyType === PropertyType.INDEXED_GROUP ||
+            prop.propertyType === PropertyType.NAMED_GROUP) {
+            var found = findPropertyInTree(prop, name);
+            if (found) return found;
+        }
+    }
+    return null;
+}
+
+// Resolve a property on a layer either by an exact path (array of names/matchNames,
+// walked down one level at a time - use this to disambiguate, e.g. a Blurriness
+// param on one of several applied effects), or by a single name/matchName searched
+// anywhere in the layer's property tree (transform shortcuts checked first).
+function resolveLayerProperty(layer, propertyName, propertyPath) {
+    if (propertyPath && propertyPath.length) {
+        var current = layer;
+        for (var i = 0; i < propertyPath.length; i++) {
+            current = current.property(propertyPath[i]);
+            if (!current) return null;
+        }
+        return current;
+    }
+
+    var shortcut = EXPRESSION_PROPERTY_SHORTCUTS[String(propertyName).toLowerCase()];
+    if (shortcut) {
+        var xf = layer.property("ADBE Transform Group");
+        var byShortcut = xf ? xf.property(shortcut) : null;
+        if (byShortcut) return byShortcut;
+    }
+
+    return findPropertyInTree(layer, propertyName);
+}
+
+// expressionError is only populated once AE actually evaluates the expression -
+// reading a property's value forces that evaluation so the error is up to date.
+function forceExpressionEvaluation(property) {
+    try { var v = property.value; } catch (e) { /* evaluation failure surfaces via expressionError */ }
+}
+
 /**
- * Sets an expression for a specific property on a layer.
+ * Sets, removes, and/or enables/disables an expression on a specific layer property.
  * @param {number} compIndex - The index of the composition (1-based).
  * @param {number} layerIndex - The index of the layer within the composition (1-based).
- * @param {string} propertyName - The name of the property (e.g., "Position", "Scale", "Rotation", "Opacity").
- * @param {string} expressionString - The JavaScript expression string. Use "" to remove expression.
- * @returns {string} JSON string indicating success or error.
+ * @param {string} propertyName - Name or matchName of the property (e.g. "Opacity"). Searched
+ *   across the whole property tree (transform, effects, text, masks, layer styles, etc.).
+ * @param {string} [expressionString] - The JavaScript expression string. Use "" to remove the
+ *   expression. Omit to leave the current expression text untouched (e.g. when only toggling `enabled`).
+ * @param {string[]} [propertyPath] - Exact path (e.g. ["Effects", "Gaussian Blur", "Blurriness"])
+ *   to disambiguate when propertyName alone could match more than one property.
+ * @param {boolean} [enabled] - Enable or disable the expression without changing its text.
+ * @returns {string} JSON string with success/error plus the resulting expression state.
  */
-function setLayerExpression(compIndex, layerIndex, propertyName, expressionString) {
+function setLayerExpression(compIndex, layerIndex, propertyName, expressionString, propertyPath, enabled) {
     try {
-         // Adjust indices to be 0-based for ExtendScript arrays
         var comp = app.project.items[compIndex];
-         if (!comp || !(comp instanceof CompItem)) {
+        if (!comp || !(comp instanceof CompItem)) {
             return JSON.stringify({ success: false, message: "Composition not found at index " + compIndex });
         }
         var layer = comp.layers[layerIndex];
-         if (!layer) {
-            return JSON.stringify({ success: false, message: "Layer not found at index " + layerIndex + " in composition '" + comp.name + "'"});
+        if (!layer) {
+            return JSON.stringify({ success: false, message: "Layer not found at index " + layerIndex + " in composition '" + comp.name + "'" });
         }
 
-        var transformGroup = layer.property("Transform");
-         if (!transformGroup) {
-             // Allow expressions on non-transformable layers if property exists elsewhere
-             // return JSON.stringify({ success: false, message: "Transform properties not found for layer '" + layer.name + "' (type: " + layer.matchName + ")." });
+        var property = resolveLayerProperty(layer, propertyName, propertyPath);
+        if (!property) {
+            return JSON.stringify({ success: false, message: "Property '" + propertyName + "' not found on layer '" + layer.name + "'." });
         }
-
-        var property = transformGroup ? transformGroup.property(propertyName) : null;
-         if (!property) {
-            // Check other common property groups if not in Transform
-             if (layer.property("Effects") && layer.property("Effects").property(propertyName)) {
-                 property = layer.property("Effects").property(propertyName);
-             } else if (layer.property("Text") && layer.property("Text").property(propertyName)) {
-                 property = layer.property("Text").property(propertyName);
-             }
-
-            // Search inside individual effects for sub-properties
-            if (!property && layer.property("Effects")) {
-                var effects = layer.property("Effects");
-                for (var ei = 1; ei <= effects.numProperties; ei++) {
-                    var eff = effects.property(ei);
-                    try {
-                        var subProp = eff.property(propertyName);
-                        if (subProp) { property = subProp; break; }
-                    } catch (e2) {}
-                }
-            }
-
-            if (!property) {
-                 return JSON.stringify({ success: false, message: "Property '" + propertyName + "' not found on layer '" + layer.name + "'." });
-            }
-        }
-
         if (!property.canSetExpression) {
-            return JSON.stringify({ success: false, message: "Property '" + propertyName + "' does not support expressions." });
+            return JSON.stringify({ success: false, message: "Property '" + property.name + "' does not support expressions." });
         }
 
-        property.expression = expressionString;
+        var actions = [];
+        if (typeof expressionString === "string") {
+            property.expression = expressionString;
+            actions.push(expressionString === "" ? "removed" : "set");
+        }
+        if (typeof enabled === "boolean" && property.expression !== "") {
+            property.expressionEnabled = enabled;
+            actions.push(enabled ? "enabled" : "disabled");
+        }
+        if (actions.length === 0) {
+            return JSON.stringify({ success: false, message: "Nothing to do: provide expressionString and/or enabled." });
+        }
 
-        var action = expressionString === "" ? "removed" : "set";
-        return JSON.stringify({ success: true, message: "Expression " + action + " for '" + propertyName + "' on layer '" + layer.name + "'." });
+        forceExpressionEvaluation(property);
+
+        return JSON.stringify({
+            success: true,
+            message: "Expression " + actions.join(" and ") + " for '" + property.name + "' on layer '" + layer.name + "'.",
+            property: property.name,
+            matchName: property.matchName,
+            expression: property.expression,
+            expressionEnabled: property.expression !== "" ? property.expressionEnabled : false,
+            expressionError: property.expression !== "" ? property.expressionError : ""
+        });
     } catch (e) {
         return JSON.stringify({ success: false, message: "Error setting expression: " + e.toString() + " (Line: " + e.line + ")" });
+    }
+}
+
+/**
+ * Lists every expression-capable property on a layer along with its current
+ * expression text, enabled state, and error (if any) - for discovering what can be
+ * targeted and for checking/fixing what is already applied.
+ * @param {number} compIndex - The index of the composition (1-based).
+ * @param {number} layerIndex - The index of the layer within the composition (1-based).
+ * @returns {string} JSON string with the layer's expression-capable properties.
+ */
+function getLayerExpressions(compIndex, layerIndex) {
+    try {
+        var comp = app.project.items[compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ success: false, message: "Composition not found at index " + compIndex });
+        }
+        var layer = comp.layers[layerIndex];
+        if (!layer) {
+            return JSON.stringify({ success: false, message: "Layer not found at index " + layerIndex + " in composition '" + comp.name + "'" });
+        }
+
+        var properties = [];
+
+        function walk(group, path) {
+            for (var i = 1; i <= group.numProperties; i++) {
+                var prop = group.property(i);
+                var propPath = path ? (path + " > " + prop.name) : prop.name;
+                if (prop.propertyType === PropertyType.PROPERTY) {
+                    if (prop.canSetExpression) {
+                        var hasExpression = prop.expression !== "";
+                        if (hasExpression) forceExpressionEvaluation(prop);
+                        properties.push({
+                            path: propPath,
+                            matchName: prop.matchName,
+                            hasExpression: hasExpression,
+                            expression: prop.expression,
+                            expressionEnabled: hasExpression ? prop.expressionEnabled : false,
+                            expressionError: hasExpression ? prop.expressionError : ""
+                        });
+                    }
+                } else if (prop.propertyType === PropertyType.INDEXED_GROUP ||
+                           prop.propertyType === PropertyType.NAMED_GROUP) {
+                    walk(prop, propPath);
+                }
+            }
+        }
+
+        walk(layer, "");
+
+        return JSON.stringify({ success: true, layer: layer.name, properties: properties });
+    } catch (e) {
+        return JSON.stringify({ success: false, message: "Error getting layer expressions: " + e.toString() + " (Line: " + e.line + ")" });
+    }
+}
+
+/**
+ * Scans for expression errors and disabled expressions across the whole project,
+ * a single composition, or a single layer.
+ * @param {Object} args
+ * @param {string} [args.scope="project"] - "project", "comp", or "layer".
+ * @param {number} [args.compIndex] - Required for scope "comp" or "layer" (1-based).
+ * @param {number} [args.layerIndex] - Required for scope "layer" (1-based).
+ * @returns {string} JSON string with totals plus errors[] and disabled[] lists.
+ */
+function getExpressionErrors(args) {
+    try {
+        args = args || {};
+        var scope = args.scope || "project";
+        var result = { totalExpressions: 0, totalErrors: 0, totalDisabled: 0, errors: [], disabled: [] };
+
+        function scanProperties(propertyGroup, compName, layerName, path) {
+            for (var i = 1; i <= propertyGroup.numProperties; i++) {
+                var prop = propertyGroup.property(i);
+                if (prop.propertyType === PropertyType.PROPERTY) {
+                    if (prop.canSetExpression && prop.expression !== "") {
+                        result.totalExpressions++;
+                        forceExpressionEvaluation(prop);
+                        if (!prop.expressionEnabled) {
+                            result.totalDisabled++;
+                            result.disabled.push({
+                                comp: compName,
+                                layer: layerName,
+                                property: path + " > " + prop.name,
+                                matchName: prop.matchName
+                            });
+                        } else if (prop.expressionError !== "") {
+                            result.totalErrors++;
+                            result.errors.push({
+                                comp: compName,
+                                layer: layerName,
+                                property: path + " > " + prop.name,
+                                matchName: prop.matchName,
+                                error: prop.expressionError,
+                                expression: prop.expression.substring(0, 200)
+                            });
+                        }
+                    }
+                } else if (prop.propertyType === PropertyType.INDEXED_GROUP ||
+                           prop.propertyType === PropertyType.NAMED_GROUP) {
+                    scanProperties(prop, compName, layerName, path + " > " + prop.name);
+                }
+            }
+        }
+
+        function scanComp(comp) {
+            for (var j = 1; j <= comp.numLayers; j++) {
+                var layer = comp.layer(j);
+                scanProperties(layer, comp.name, layer.name, "");
+            }
+        }
+
+        if (scope === "project") {
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var item = app.project.item(i);
+                if (item instanceof CompItem) scanComp(item);
+            }
+        } else if (scope === "comp" || scope === "layer") {
+            var comp = app.project.items[args.compIndex];
+            if (!comp || !(comp instanceof CompItem)) {
+                return JSON.stringify({ success: false, message: "Composition not found at index " + args.compIndex });
+            }
+            if (scope === "comp") {
+                scanComp(comp);
+            } else {
+                var layer = comp.layers[args.layerIndex];
+                if (!layer) {
+                    return JSON.stringify({ success: false, message: "Layer not found at index " + args.layerIndex + " in composition '" + comp.name + "'" });
+                }
+                scanProperties(layer, comp.name, layer.name, "");
+            }
+        } else {
+            return JSON.stringify({ success: false, message: "Invalid scope '" + scope + "'. Use 'project', 'comp', or 'layer'." });
+        }
+
+        result.success = true;
+        return JSON.stringify(result);
+    } catch (e) {
+        return JSON.stringify({ success: false, message: "Error scanning expression errors: " + e.toString() + " (Line: " + e.line + ")" });
+    }
+}
+
+// --- Essential Graphics panel helpers ---
+// AE only lets a Checkbox, Color, single-value numerical Slider (e.g. Opacity, Slider Control),
+// or Source Text property be exposed here (canAddToMotionGraphicsTemplate enforces this) - and
+// there is no scripting API to remove an entry once added; that has to be done by hand in the
+// panel (or by deleting the underlying property in the Timeline).
+
+/**
+ * Adds a layer property to the Essential Graphics panel for a composition.
+ * @param {Object} args
+ * @param {number} args.compIndex - 1-based composition index.
+ * @param {number} args.layerIndex - 1-based layer index within the composition.
+ * @param {string} args.propertyName - Name or matchName of the property to expose.
+ * @param {string[]} [args.propertyPath] - Exact path to disambiguate, as in setLayerExpression.
+ * @param {string} [args.displayName] - Custom name to show in the Essential Graphics panel.
+ * @returns {string} JSON string with success/error plus the resulting EGP state.
+ */
+function addToEssentialGraphics(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ success: false, message: "Composition not found at index " + args.compIndex });
+        }
+        var layer = comp.layers[args.layerIndex];
+        if (!layer) {
+            return JSON.stringify({ success: false, message: "Layer not found at index " + args.layerIndex + " in composition '" + comp.name + "'" });
+        }
+
+        var property = resolveLayerProperty(layer, args.propertyName, args.propertyPath);
+        if (!property) {
+            return JSON.stringify({ success: false, message: "Property '" + args.propertyName + "' not found on layer '" + layer.name + "'." });
+        }
+        if (!property.canAddToMotionGraphicsTemplate(comp)) {
+            return JSON.stringify({ success: false, message: "Property '" + property.name + "' can't be added to Essential Graphics - only a Checkbox, Color, single-value numerical Slider, or Source Text property is supported, and it may already have been added." });
+        }
+
+        var added = (typeof args.displayName === "string" && args.displayName !== "")
+            ? property.addToMotionGraphicsTemplateAs(comp, args.displayName)
+            : property.addToMotionGraphicsTemplate(comp);
+
+        if (!added) {
+            return JSON.stringify({ success: false, message: "After Effects declined to add '" + property.name + "' to Essential Graphics." });
+        }
+
+        return JSON.stringify({
+            success: true,
+            message: "Added '" + property.name + "' on layer '" + layer.name + "' to the Essential Graphics panel for '" + comp.name + "'.",
+            property: property.name,
+            matchName: property.matchName,
+            controllerCount: comp.motionGraphicsTemplateControllerCount
+        });
+    } catch (e) {
+        return JSON.stringify({ success: false, message: "Error adding to Essential Graphics: " + e.toString() + " (Line: " + e.line + ")" });
+    }
+}
+
+/**
+ * Lists the Essential Graphics panel's template name and every property currently exposed
+ * for a composition.
+ * @param {Object} args
+ * @param {number} args.compIndex - 1-based composition index.
+ * @returns {string} JSON string with the template name and an array of {index, name}.
+ */
+function getEssentialGraphics(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ success: false, message: "Composition not found at index " + args.compIndex });
+        }
+
+        var properties = [];
+        var count = comp.motionGraphicsTemplateControllerCount;
+        for (var i = 1; i <= count; i++) {
+            properties.push({ index: i, name: comp.getMotionGraphicsTemplateControllerName(i) });
+        }
+
+        return JSON.stringify({
+            success: true,
+            comp: comp.name,
+            templateName: comp.motionGraphicsTemplateName,
+            controllerCount: count,
+            properties: properties
+        });
+    } catch (e) {
+        return JSON.stringify({ success: false, message: "Error getting Essential Graphics info: " + e.toString() + " (Line: " + e.line + ")" });
+    }
+}
+
+/**
+ * Renames an existing Essential Graphics entry and/or sets the composition's Motion Graphics
+ * template name (used as the exported .mogrt filename).
+ * @param {Object} args
+ * @param {number} args.compIndex - 1-based composition index.
+ * @param {number} [args.controllerIndex] - 1-based index (see getEssentialGraphics) of the entry to rename.
+ * @param {string} [args.newName] - New display name for that entry. Required together with controllerIndex.
+ * @param {string} [args.templateName] - New Motion Graphics template (.mogrt) name for the composition.
+ * @returns {string} JSON string with success/error plus the resulting EGP state.
+ */
+function setEssentialGraphicsProperty(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ success: false, message: "Composition not found at index " + args.compIndex });
+        }
+
+        var actions = [];
+        if (typeof args.templateName === "string") {
+            comp.motionGraphicsTemplateName = args.templateName;
+            actions.push("template name set to '" + args.templateName + "'");
+        }
+        if (args.controllerIndex !== undefined && args.controllerIndex !== null && typeof args.newName === "string") {
+            comp.setMotionGraphicsControllerName(args.controllerIndex, args.newName);
+            actions.push("property " + args.controllerIndex + " renamed to '" + args.newName + "'");
+        }
+        if (actions.length === 0) {
+            return JSON.stringify({ success: false, message: "Nothing to do: provide templateName, and/or controllerIndex together with newName." });
+        }
+
+        return JSON.stringify({
+            success: true,
+            message: actions.join("; ") + ".",
+            comp: comp.name,
+            templateName: comp.motionGraphicsTemplateName,
+            controllerCount: comp.motionGraphicsTemplateControllerCount
+        });
+    } catch (e) {
+        return JSON.stringify({ success: false, message: "Error setting Essential Graphics property: " + e.toString() + " (Line: " + e.line + ")" });
     }
 }
 
@@ -1281,37 +1607,14 @@ if (typeof JSON.stringify !== "function") {
     })();
 }
 
-// Detect AE version (AE 2025 = version 25.x, AE 2026 = version 26.x)
-var aeVersion = parseFloat(app.version);
-var isAE2025OrLater = aeVersion >= 25.0;
-
-// Always create a floating palette window for AE 2025+
-var panel = new Window("palette", "MCP Bridge Auto", undefined);
-panel.orientation = "column";
-panel.alignChildren = ["fill", "top"];
-panel.spacing = 10;
-panel.margins = 16;
-
-// Status display
-var statusText = panel.add("statictext", undefined, "Waiting for commands...");
-statusText.alignment = ["fill", "top"];
-
-// Add log area
-var logPanel = panel.add("panel", undefined, "Command Log");
-logPanel.orientation = "column";
-logPanel.alignChildren = ["fill", "fill"];
-var logText = logPanel.add("edittext", undefined, "", {multiline: true, readonly: true});
-logText.preferredSize.height = 200;
-
-// AE 2025 warning
-if (isAE2025OrLater) {
-    var warning = panel.add("statictext", undefined, "AE 2025+: Dockable panels are not supported. Floating window only.");
-    warning.graphics.foregroundColor = warning.graphics.newPen(warning.graphics.PenType.SOLID_COLOR, [1,0.3,0,1], 1);
-}
-
-// Auto-run checkbox
-var autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
-autoRunCheckbox.value = true;
+// Panel UI state, kept on $.global rather than as plain script-level vars. The reload link
+// further down re-evaluates this whole file via $.evalFile from inside a button handler, and
+// ExtendScript's `eval` can shadow top-level var/function redeclarations into that handler's
+// own local scope instead of updating the true globals - so a script-level `var panel` could
+// silently fail to reach the panel logToPanel/checkForCommands already use. $.global properties
+// don't have that ambiguity: every scope reads and writes the exact same shared object.
+$.global.mcpBridge = $.global.mcpBridge || {};
+var mcpBridge = $.global.mcpBridge;
 
 // Check interval (ms)
 var checkInterval = 2000;
@@ -1499,8 +1802,10 @@ function executeCommand(command, args) {
     var result = "";
 
     logToPanel("Executing command: " + command);
-    statusText.text = "Running: " + command;
-    panel.update();
+    mcpBridge.statusText.text = "Running: " + command;
+    // .update() only exists on a floating Window, not a docked Panel - only the former needs
+    // an explicit repaint anyway.
+    if (mcpBridge.panel instanceof Window) mcpBridge.panel.update();
 
     try {
         logToPanel("Attempting to execute: " + command); // Log before switch
@@ -1547,8 +1852,33 @@ function executeCommand(command, args) {
                 break;
             case "setLayerExpression":
                 logToPanel("Calling setLayerExpression function...");
-                result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
+                result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString, args.propertyPath, args.enabled);
                 logToPanel("Returned from setLayerExpression.");
+                break;
+            case "getLayerExpressions":
+                logToPanel("Calling getLayerExpressions function...");
+                result = getLayerExpressions(args.compIndex, args.layerIndex);
+                logToPanel("Returned from getLayerExpressions.");
+                break;
+            case "getExpressionErrors":
+                logToPanel("Calling getExpressionErrors function...");
+                result = getExpressionErrors(args);
+                logToPanel("Returned from getExpressionErrors.");
+                break;
+            case "addToEssentialGraphics":
+                logToPanel("Calling addToEssentialGraphics function...");
+                result = addToEssentialGraphics(args);
+                logToPanel("Returned from addToEssentialGraphics.");
+                break;
+            case "getEssentialGraphics":
+                logToPanel("Calling getEssentialGraphics function...");
+                result = getEssentialGraphics(args);
+                logToPanel("Returned from getEssentialGraphics.");
+                break;
+            case "setEssentialGraphicsProperty":
+                logToPanel("Calling setEssentialGraphicsProperty function...");
+                result = setEssentialGraphicsProperty(args);
+                logToPanel("Returned from setEssentialGraphicsProperty.");
                 break;
             case "applyEffect":
                 logToPanel("Calling applyEffect function...");
@@ -1641,7 +1971,7 @@ function executeCommand(command, args) {
         logToPanel("Result file write process complete.");
         
         logToPanel("Command completed successfully: " + command); // Changed log message
-        statusText.text = "Command completed: " + command;
+        mcpBridge.statusText.text = "Command completed: " + command;
         
         // Update command file status
         logToPanel("Updating command status to completed...");
@@ -1651,7 +1981,7 @@ function executeCommand(command, args) {
     } catch (error) {
         var errorMsg = "ERROR in executeCommand for '" + command + "': " + error.toString() + (error.line ? " (line: " + error.line + ")" : "");
         logToPanel(errorMsg); // Log detailed error
-        statusText.text = "Error: " + error.toString();
+        mcpBridge.statusText.text = "Error: " + error.toString();
         
         // Write detailed error to result file
         try {
@@ -1709,32 +2039,32 @@ function updateCommandStatus(status) {
 // Log message to panel
 function logToPanel(message) {
     var timestamp = new Date().toLocaleTimeString();
-    logText.text = timestamp + ": " + message + "\n" + logText.text;
+    mcpBridge.logText.text = timestamp + ": " + message + "\n" + mcpBridge.logText.text;
 }
 
 // Check for new commands
 function checkForCommands() {
-    if (!autoRunCheckbox.value || isChecking) return;
-    
+    if (!mcpBridge.autoRunCheckbox.value || isChecking) return;
+
     isChecking = true;
-    
+
     try {
         var commandFile = new File(getCommandFilePath());
         if (commandFile.exists) {
             commandFile.open("r");
             var content = commandFile.read();
             commandFile.close();
-            
+
             if (content) {
                 var commandData = (typeof JSON !== "undefined" && JSON.parse)
                     ? JSON.parse(content)
                     : eval("(" + content + ")");
-                
+
                 // Only execute pending commands
                 if (commandData.status === "pending") {
                     // Update status to running
                     updateCommandStatus("running");
-                    
+
                     // Execute the command
                     executeCommand(commandData.command, commandData.args || {});
                 }
@@ -1743,31 +2073,101 @@ function checkForCommands() {
     } catch (e) {
         logToPanel("Error checking for commands: " + e.toString());
     }
-    
+
     isChecking = false;
 }
+// Always point $.global.mcpBridge.checkForCommands at the version just defined above, so the
+// scheduled task below (which calls it dynamically through $.global, not a lexical reference)
+// runs the latest edits after a reload rather than whatever was current at the first AE launch.
+mcpBridge.checkForCommands = checkForCommands;
 
-// Set up timer to check for commands
+// Set up timer to check for commands. Only ever called once (see the bottom of this file) -
+// re-scheduling on every reload would stack duplicate timers, all polling the same files.
 function startCommandChecker() {
-    app.scheduleTask("checkForCommands()", checkInterval, true);
+    app.scheduleTask("$.global.mcpBridge.checkForCommands()", checkInterval, true);
 }
 
-// Add manual check button
-var checkButton = panel.add("button", undefined, "Check for Commands Now");
-checkButton.onClick = function() {
-    logToPanel("Manually checking for commands");
-    checkForCommands();
-};
+// Builds (or, via the reload link, rebuilds) the panel's controls onto `thisObj` - a docked
+// Panel when opened from Window > mcp-bridge-auto.jsx, or a new floating palette when run via
+// File > Scripts > Run Script File (not a Panel in that case).
+function buildBridgeUI(thisObj) {
+    var panel = mcpBridge.panel = (thisObj instanceof Panel) ? thisObj : new Window("palette", "MCP Bridge Auto", undefined);
+    panel.orientation = "column";
+    panel.alignChildren = ["fill", "top"];
+    panel.spacing = 10;
+    panel.margins = 16;
 
-// Log startup
-logToPanel("MCP Bridge Auto started");
-logToPanel("Command file: " + getCommandFilePath());
-statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
+    // Dev tool: AE only reads a ScriptUI Panels file once when the panel is first opened in a
+    // session, so normally you'd have to restart AE to see edits to this script. This re-reads
+    // the file from disk and rebuilds the panel's contents in place instead.
+    var reloadLink = panel.add("statictext", undefined, "reload script");
+    reloadLink.alignment = ["right", "top"];
+    reloadLink.addEventListener("mousedown", function () {
+        try {
+            while (mcpBridge.panel.children.length > 0) {
+                mcpBridge.panel.remove(mcpBridge.panel.children[0]);
+            }
+            // Re-evaluating this file runs the bottom bootstrap again, which finds
+            // $.global.mcpBridge.panel already set and calls buildBridgeUI(mcpBridge.panel) -
+            // rebuilding onto this same panel rather than creating a new floating window.
+            $.evalFile(new File(THIS_SCRIPT_FILE));
+        } catch (e) {
+            alert("Reload failed: " + e.toString() + " (line " + e.line + ")");
+        }
+    });
 
-// Start the command checker
-startCommandChecker();
+    // Status display
+    var statusText = mcpBridge.statusText = panel.add("statictext", undefined, "Waiting for commands...");
+    statusText.alignment = ["fill", "top"];
 
-// Show the panel
-panel.center();
-panel.show();
+    // Add log area (fills remaining vertical space and grows as the panel/dock is resized)
+    var logPanel = panel.add("panel", undefined, "Command Log");
+    logPanel.orientation = "column";
+    logPanel.alignChildren = ["fill", "fill"];
+    logPanel.alignment = ["fill", "fill"];
+    var logText = mcpBridge.logText = logPanel.add("edittext", undefined, "", {multiline: true, readonly: true, scrolling: true});
+    logText.alignment = ["fill", "fill"];
+    logText.minimumSize.height = 150;
+
+    panel.onResizing = panel.onResize = function () {
+        this.layout.resize();
+    };
+
+    // Auto-run checkbox
+    var autoRunCheckbox = mcpBridge.autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
+    autoRunCheckbox.value = true;
+
+    // Add manual check button
+    var checkButton = panel.add("button", undefined, "Check for Commands Now");
+    checkButton.onClick = function() {
+        logToPanel("Manually checking for commands");
+        checkForCommands();
+    };
+
+    // Log startup
+    logToPanel("MCP Bridge Auto started");
+    logToPanel("Command file: " + getCommandFilePath());
+    statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
+
+    // Show the panel (docked panels are shown/positioned by AE itself)
+    if (panel instanceof Window) {
+        panel.center();
+        panel.show();
+    } else {
+        panel.layout.layout(true);
+        panel.layout.resize();
+    }
+
+    return panel;
+}
+
+// $.global.mcpBridge.panel only gets set once buildBridgeUI has actually run - so this tells
+// a true first load (panel not built yet, needs the one-time command-checker task started)
+// apart from a reload (panel already exists - reuse it, and don't stack a second task).
+if (!mcpBridge.panel) {
+    buildBridgeUI(this);
+    startCommandChecker();
+} else {
+    buildBridgeUI(mcpBridge.panel);
+}
 
