@@ -1327,13 +1327,19 @@ function applyEffect(args) {
         // Apply effect by match name (more reliable method)
         else if (effectMatchName) {
             var effect = layer.Effects.addProperty(effectMatchName);
+            // effectName, when given ALONGSIDE effectMatchName, renames the
+            // new instance instead of being used to look it up -- lets
+            // e.g. three "ADBE Slider Control" effects on the same layer
+            // get distinct names ("Bounce Height", "Squish Amount", ...)
+            // so expressions can reference them by name unambiguously.
+            if (effectName) { effect.name = effectName; }
             effectResult = {
                 type: "effect",
                 name: effect.name,
                 matchName: effect.matchName,
                 index: effect.propertyIndex
             };
-            
+
             // Apply settings if provided
             applyEffectSettings(effect, effectSettings);
         }
