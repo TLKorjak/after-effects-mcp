@@ -60,12 +60,54 @@ function createShapeLayer(args) {
         } else if (shapeType === "polygon" || shapeType === "star") { // Combine polygon/star logic
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Star");
             shapePathProperty.property("Type").setValue(shapeType === "polygon" ? 1 : 2); // 1=Polygon, 2=Star
-            shapePathProperty.property("Points").setValue(points);
+            shapePathProperty.property("Points").setValue(points instanceof Array ? 5 : points);
             shapePathProperty.property("Outer Radius").setValue(size[0] / 2);
             // For stars, set inner radius; for polygons, maybe outer roundness if needed
             if (shapeType === "star") {
                 shapePathProperty.property("Inner Radius").setValue(size[0] / 3);
             }
+        } else if (shapeType === "custom") {
+            // Arbitrary polygon (or curved path) from explicit vertices —
+            // e.g. arrows, chevrons, speech bubbles, hearts, rounded blobs:
+            // anything the built-in rect/ellipse/star primitives can't
+            // express. `points` here means an array of vertices (in
+            // coordinates relative to the layer's Position, e.g. a shape
+            // centered on Position would use vertices centered around
+            // [0,0]), NOT a point count like it means for polygon/star
+            // above. Each vertex is either:
+            //   - [x, y] — a straight corner (zero tangent handles), or
+            //   - {point:[x,y], inTangent:[dx,dy], outTangent:[dx,dy]} — a
+            //     curve handle, tangents as relative offsets from the
+            //     vertex (standard AE Shape.inTangents/outTangents
+            //     convention — NOT absolute positions). Omit inTangent or
+            //     outTangent on an object vertex to default that side to
+            //     [0,0]; straight and curved vertices can be freely mixed
+            //     in the same path.
+            if (!(points instanceof Array) || points.length < 3) {
+                throw new Error("shapeType 'custom' requires a 'points' array of at least 3 vertices (relative to the layer's Position). Each vertex is [x,y] for a straight corner, or {point:[x,y], inTangent:[dx,dy], outTangent:[dx,dy]} for a curve handle. For a point COUNT on a regular polygon/star, use shapeType 'polygon' or 'star' instead.");
+            }
+            shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Group");
+            var customShape = new Shape();
+            var verts = [];
+            var inTans = [];
+            var outTans = [];
+            for (var vi = 0; vi < points.length; vi++) {
+                var vp = points[vi];
+                if (vp instanceof Array) {
+                    verts.push(vp);
+                    inTans.push([0, 0]);
+                    outTans.push([0, 0]);
+                } else {
+                    verts.push(vp.point);
+                    inTans.push(vp.inTangent || [0, 0]);
+                    outTans.push(vp.outTangent || [0, 0]);
+                }
+            }
+            customShape.vertices = verts;
+            customShape.inTangents = inTans;
+            customShape.outTangents = outTans;
+            customShape.closed = (args.closed === undefined) ? true : !!args.closed;
+            shapePathProperty.property("Path").setValue(customShape);
         }
         
         // Add fill TO THE GROUP'S CONTENTS

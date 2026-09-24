@@ -119,12 +119,46 @@ function createShapeLayer(args) {
         } else if (shapeType === "ellipse") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Ellipse");
             shapePathProperty.property("Size").setValue(size);
-        } else if (shapeType === "polygon" || shapeType === "star") { 
+        } else if (shapeType === "polygon" || shapeType === "star") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Star");
-            shapePathProperty.property("Type").setValue(shapeType === "polygon" ? 1 : 2); 
-            shapePathProperty.property("Points").setValue(points);
+            shapePathProperty.property("Type").setValue(shapeType === "polygon" ? 1 : 2);
+            shapePathProperty.property("Points").setValue(points instanceof Array ? 5 : points);
             shapePathProperty.property("Outer Radius").setValue(size[0] / 2);
             if (shapeType === "star") { shapePathProperty.property("Inner Radius").setValue(size[0] / 3); }
+        } else if (shapeType === "custom") {
+            // Arbitrary polygon or curved path from explicit vertices
+            // (relative to the layer's Position) — arrows, chevrons,
+            // hearts, rounded blobs, etc. `points` here is the vertex
+            // array, NOT a point count like for polygon/star above. Each
+            // vertex is either [x,y] (straight corner) or
+            // {point:[x,y], inTangent:[dx,dy], outTangent:[dx,dy]} (curve
+            // handle — tangents are relative offsets from the vertex, AE
+            // convention; omit either side to default it to [0,0]).
+            if (!(points instanceof Array) || points.length < 3) {
+                throw new Error("shapeType 'custom' requires a 'points' array of at least 3 vertices (relative to the layer's Position). Each vertex is [x,y] for a straight corner, or {point:[x,y], inTangent:[dx,dy], outTangent:[dx,dy]} for a curve handle. For a point COUNT on a regular polygon/star, use shapeType 'polygon' or 'star' instead.");
+            }
+            shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Group");
+            var customShape = new Shape();
+            var verts = [];
+            var inTans = [];
+            var outTans = [];
+            for (var vi = 0; vi < points.length; vi++) {
+                var vp = points[vi];
+                if (vp instanceof Array) {
+                    verts.push(vp);
+                    inTans.push([0, 0]);
+                    outTans.push([0, 0]);
+                } else {
+                    verts.push(vp.point);
+                    inTans.push(vp.inTangent || [0, 0]);
+                    outTans.push(vp.outTangent || [0, 0]);
+                }
+            }
+            customShape.vertices = verts;
+            customShape.inTangents = inTans;
+            customShape.outTangents = outTans;
+            customShape.closed = (args.closed === undefined) ? true : !!args.closed;
+            shapePathProperty.property("Path").setValue(customShape);
         }
         var fill = groupContents.addProperty("ADBE Vector Graphic - Fill");
         fill.property("Color").setValue(fillColor);
