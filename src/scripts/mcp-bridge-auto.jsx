@@ -181,6 +181,58 @@ function createShapeLayer(args) {
     }
 }
 
+// --- renderFrame (from renderFrame.jsx) ---
+// Saves a single frame of a composition to a PNG file, for visual
+// verification of script-driven changes rather than trusting a script's
+// own "success" report alone.
+function renderFrame(args) {
+    try {
+        var compName = args.compName || "";
+        var time = (args.time !== undefined) ? args.time : 0;
+        var comp = null;
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var item = app.project.item(i);
+            if (item instanceof CompItem && item.name === compName) { comp = item; break; }
+        }
+        if (!comp) {
+            if (app.project.activeItem instanceof CompItem) { comp = app.project.activeItem; }
+            else { throw new Error("No composition found with name '" + compName + "' and no active composition"); }
+        }
+        // Same temp folder the Node side uses (~/Documents/ae-mcp-bridge) so
+        // the file is always in a known, discoverable location.
+        var userFolder = Folder.myDocuments;
+        var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
+        if (!bridgeFolder.exists) bridgeFolder.create();
+        var fileName = args.fileName || "render-preview.png";
+        var outFile = new File(bridgeFolder.fsName + "/" + fileName);
+        // Remove any stale file first so we reliably detect the NEW one landing.
+        if (outFile.exists) outFile.remove();
+
+        comp.saveFrameToPng(time, outFile);
+
+        // saveFrameToPng is undocumented and asynchronous -- it can return
+        // before the file actually exists on disk. Poll briefly.
+        var waitedMs = 0;
+        var maxWaitMs = 5000;
+        var stepMs = 150;
+        while (waitedMs < maxWaitMs) {
+            if (outFile.exists && outFile.length > 0) break;
+            $.sleep(stepMs);
+            waitedMs += stepMs;
+        }
+        if (!outFile.exists) {
+            throw new Error("saveFrameToPng did not produce a file within " + maxWaitMs + "ms at " + outFile.fsName);
+        }
+
+        return JSON.stringify({
+            status: "success", message: "Frame rendered",
+            comp: comp.name, time: time, pngPath: outFile.fsName, waitedMs: waitedMs
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 // --- createCamera ---
 function createCamera(args) {
     try {
@@ -1868,6 +1920,11 @@ function executeCommand(command, args) {
                 logToPanel("Calling createShapeLayer function...");
                 result = createShapeLayer(args);
                 logToPanel("Returned from createShapeLayer. Result type: " + typeof result);
+                break;
+            case "renderFrame":
+                logToPanel("Calling renderFrame function...");
+                result = renderFrame(args);
+                logToPanel("Returned from renderFrame. Result type: " + typeof result);
                 break;
             case "createSolidLayer":
                 logToPanel("Calling createSolidLayer function...");

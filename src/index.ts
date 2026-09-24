@@ -177,6 +177,7 @@ server.tool(
       "createComposition",
       "createTextLayer",
       "createShapeLayer",
+      "renderFrame",
       "createSolidLayer",
       "setLayerProperties",
       "setLayerKeyframe",
@@ -365,6 +366,7 @@ Available scripts:
 - createComposition: Create a new composition
 - createTextLayer: Create a new text layer
 - createShapeLayer: Create a new shape layer
+- renderFrame: Save a single composition frame to a PNG for visual verification (returns a pngPath to read)
 - createSolidLayer: Create a new solid layer
 - setLayerProperties: Set properties for a layer
 - setLayerKeyframe: Set a keyframe for a layer property
