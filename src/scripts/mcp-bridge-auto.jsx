@@ -2141,7 +2141,18 @@ function logToPanel(message) {
 
 // Check for new commands
 function checkForCommands() {
-    if (!mcpBridge.autoRunCheckbox.value || isChecking) return;
+    try {
+        if (!mcpBridge.autoRunCheckbox.value || isChecking) return;
+    } catch (e) {
+        // The panel's UI was destroyed (closed without onClose firing, e.g. a docked panel
+        // removed from the workspace) but this scheduled task has no way to know that on its
+        // own - it just keeps firing every checkInterval forever, hitting the same dead
+        // reference each time. Self-cancel instead of nagging with an error dialog every cycle.
+        if (mcpBridge.scheduledTaskId !== undefined) {
+            try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e2) {}
+        }
+        return;
+    }
 
     isChecking = true;
 
@@ -2181,7 +2192,7 @@ mcpBridge.checkForCommands = checkForCommands;
 // Set up timer to check for commands. Only ever called once (see the bottom of this file) -
 // re-scheduling on every reload would stack duplicate timers, all polling the same files.
 function startCommandChecker() {
-    app.scheduleTask("$.global.mcpBridge.checkForCommands()", checkInterval, true);
+    mcpBridge.scheduledTaskId = app.scheduleTask("$.global.mcpBridge.checkForCommands()", checkInterval, true);
 }
 
 // Builds (or, via the reload link, rebuilds) the panel's controls onto `thisObj` - a docked
@@ -2245,6 +2256,16 @@ function buildBridgeUI(thisObj) {
     logToPanel("MCP Bridge Auto started");
     logToPanel("Command file: " + getCommandFilePath());
     statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
+
+    // Best-effort immediate cleanup - reliable for a floating Window (run via File > Scripts >
+    // Run Script File), not guaranteed for a docked Panel (AE doesn't always fire this when a
+    // docked panel is closed/removed from the workspace). The self-cancel check inside
+    // checkForCommands() is the backstop that covers the docked case too.
+    panel.onClose = function () {
+        if (mcpBridge.scheduledTaskId !== undefined) {
+            try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e) {}
+        }
+    };
 
     // Show the panel (docked panels are shown/positioned by AE itself)
     if (panel instanceof Window) {
