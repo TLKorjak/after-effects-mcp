@@ -2215,12 +2215,15 @@ function buildBridgeUI(thisObj) {
             while (mcpBridge.panel.children.length > 0) {
                 mcpBridge.panel.remove(mcpBridge.panel.children[0]);
             }
-            // Re-evaluating this file runs the bottom bootstrap again, which finds
-            // $.global.mcpBridge.panel already set and calls buildBridgeUI(mcpBridge.panel) -
-            // rebuilding onto this same panel rather than creating a new floating window.
+            // The bootstrap at the bottom of the file sees this flag and rebuilds onto this
+            // same panel instead of treating the re-run as a fresh open.
+            mcpBridge.reloading = true;
             $.evalFile(new File(THIS_SCRIPT_FILE));
         } catch (e) {
-            alert("Reload failed: " + e.toString() + " (line " + e.line + ")");
+            // Not alert(): a modal dialog blocks every other script in AE until dismissed.
+            try { logToPanel("Reload failed: " + e.toString() + " (line " + e.line + ")"); } catch (e2) {}
+        } finally {
+            mcpBridge.reloading = false;
         }
     });
 
@@ -2279,13 +2282,16 @@ function buildBridgeUI(thisObj) {
     return panel;
 }
 
-// $.global.mcpBridge.panel only gets set once buildBridgeUI has actually run - so this tells
-// a true first load (panel not built yet, needs the one-time command-checker task started)
-// apart from a reload (panel already exists - reuse it, and don't stack a second task).
-if (!mcpBridge.panel) {
+// Only the reload link sets mcpBridge.reloading. Anything else - first launch, or reopening the
+// panel after closing it - is a fresh start: mcpBridge.panel may still point at the closed (now
+// invalid) panel, so build onto `this` and restart the poll, cancelling any leftover task first.
+if (mcpBridge.reloading) {
+    buildBridgeUI(mcpBridge.panel);
+} else {
+    if (mcpBridge.scheduledTaskId !== undefined) {
+        try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e) {}
+    }
     buildBridgeUI(this);
     startCommandChecker();
-} else {
-    buildBridgeUI(mcpBridge.panel);
 }
 
