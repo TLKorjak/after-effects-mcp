@@ -1894,10 +1894,12 @@ function executeCommand(command, args) {
     var result = "";
 
     logToPanel("Executing command: " + command);
-    mcpBridge.statusText.text = "Running: " + command;
+    setPanelStatus("Running: " + command);
     // .update() only exists on a floating Window, not a docked Panel - only the former needs
     // an explicit repaint anyway.
-    if (mcpBridge.panel instanceof Window) mcpBridge.panel.update();
+    withPanelUI(function () {
+        if (mcpBridge.panel instanceof Window) mcpBridge.panel.update();
+    });
 
     try {
         logToPanel("Attempting to execute: " + command); // Log before switch
@@ -2068,7 +2070,7 @@ function executeCommand(command, args) {
         logToPanel("Result file write process complete.");
         
         logToPanel("Command completed successfully: " + command); // Changed log message
-        mcpBridge.statusText.text = "Command completed: " + command;
+        setPanelStatus("Command completed: " + command);
         
         // Update command file status
         logToPanel("Updating command status to completed...");
@@ -2078,7 +2080,7 @@ function executeCommand(command, args) {
     } catch (error) {
         var errorMsg = "ERROR in executeCommand for '" + command + "': " + error.toString() + (error.line ? " (line: " + error.line + ")" : "");
         logToPanel(errorMsg); // Log detailed error
-        mcpBridge.statusText.text = "Error: " + error.toString();
+        setPanelStatus("Error: " + error.toString());
         
         // Write detailed error to result file
         try {
@@ -2133,26 +2135,48 @@ function updateCommandStatus(status) {
     }
 }
 
-// Log message to panel
-function logToPanel(message) {
-    var timestamp = new Date().toLocaleTimeString();
-    mcpBridge.logText.text = timestamp + ": " + message + "\n" + mcpBridge.logText.text;
+// Every panel update goes through here. Once the panel has been closed its controls are
+// invalid, and touching one raises "Object is invalid" - so after the first failure (or the
+// close handler firing) mcpBridge.uiAlive goes false and the panel is never touched again.
+function withPanelUI(fn) {
+    if (!mcpBridge.uiAlive) return;
+    try {
+        fn();
+    } catch (e) {
+        mcpBridge.uiAlive = false;
+    }
 }
 
-// Check for new commands
+// Log message to panel
+function logToPanel(message) {
+    withPanelUI(function () {
+        var timestamp = new Date().toLocaleTimeString();
+        mcpBridge.logText.text = timestamp + ": " + message + "\n" + mcpBridge.logText.text;
+    });
+}
+
+function setPanelStatus(text) {
+    withPanelUI(function () {
+        mcpBridge.statusText.text = text;
+    });
+}
+
+function stopCommandChecker() {
+    if (mcpBridge.scheduledTaskId !== undefined) {
+        try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e) {}
+        mcpBridge.scheduledTaskId = undefined;
+    }
+}
+
+// Check for new commands. Runs on a timer, so it reads only plain values (mcpBridge.autoRun,
+// mcpBridge.uiAlive), never the panel's controls - a timer tick after the panel is closed
+// must not touch the closed panel.
 function checkForCommands() {
-    try {
-        if (!mcpBridge.autoRunCheckbox.value || isChecking) return;
-    } catch (e) {
-        // The panel's UI was destroyed (closed without onClose firing, e.g. a docked panel
-        // removed from the workspace) but this scheduled task has no way to know that on its
-        // own - it just keeps firing every checkInterval forever, hitting the same dead
-        // reference each time. Self-cancel instead of nagging with an error dialog every cycle.
-        if (mcpBridge.scheduledTaskId !== undefined) {
-            try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e2) {}
-        }
+    if (!mcpBridge.uiAlive) {
+        stopCommandChecker();
         return;
     }
+    if (!mcpBridge.autoRun || isChecking) return;
 
     isChecking = true;
 
@@ -2244,9 +2268,13 @@ function buildBridgeUI(thisObj) {
         this.layout.resize();
     };
 
-    // Auto-run checkbox
-    var autoRunCheckbox = mcpBridge.autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
-    autoRunCheckbox.value = true;
+    // Auto-run checkbox. The timer reads mcpBridge.autoRun, a plain value, never this control.
+    var autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
+    autoRunCheckbox.value = mcpBridge.autoRun;
+    autoRunCheckbox.onClick = function () {
+        mcpBridge.autoRun = this.value;
+        setPanelStatus("Ready - Auto-run is " + (mcpBridge.autoRun ? "ON" : "OFF"));
+    };
 
     // Add manual check button
     var checkButton = panel.add("button", undefined, "Check for Commands Now");
@@ -2255,19 +2283,21 @@ function buildBridgeUI(thisObj) {
         checkForCommands();
     };
 
+    // The controls above exist now, so panel updates are safe again (this also re-arms them
+    // after the panel was closed and reopened).
+    mcpBridge.uiAlive = true;
+
     // Log startup
     logToPanel("MCP Bridge Auto started");
     logToPanel("Command file: " + getCommandFilePath());
-    statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
+    statusText.text = "Ready - Auto-run is " + (mcpBridge.autoRun ? "ON" : "OFF");
 
-    // Best-effort immediate cleanup - reliable for a floating Window (run via File > Scripts >
-    // Run Script File), not guaranteed for a docked Panel (AE doesn't always fire this when a
-    // docked panel is closed/removed from the workspace). The self-cancel check inside
-    // checkForCommands() is the backstop that covers the docked case too.
+    // Closing the panel turns the bridge off. AE doesn't always fire this for a docked panel;
+    // in that case the timer keeps ticking without touching the panel, and the first panel
+    // update that fails (see withPanelUI) turns uiAlive off and stops it on the next tick.
     panel.onClose = function () {
-        if (mcpBridge.scheduledTaskId !== undefined) {
-            try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e) {}
-        }
+        mcpBridge.uiAlive = false;
+        stopCommandChecker();
     };
 
     // Show the panel (docked panels are shown/positioned by AE itself)
@@ -2286,11 +2316,12 @@ function buildBridgeUI(thisObj) {
 // panel after closing it - is a fresh start: mcpBridge.panel may still point at the closed (now
 // invalid) panel, so build onto `this` and restart the poll, cancelling any leftover task first.
 if (mcpBridge.reloading) {
+    if (mcpBridge.autoRun === undefined) mcpBridge.autoRun = true;
     buildBridgeUI(mcpBridge.panel);
+    if (mcpBridge.scheduledTaskId === undefined) startCommandChecker();
 } else {
-    if (mcpBridge.scheduledTaskId !== undefined) {
-        try { app.cancelTask(mcpBridge.scheduledTaskId); } catch (e) {}
-    }
+    stopCommandChecker();
+    mcpBridge.autoRun = true;
     buildBridgeUI(this);
     startCommandChecker();
 }
