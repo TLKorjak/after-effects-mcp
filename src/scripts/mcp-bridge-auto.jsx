@@ -1781,6 +1781,216 @@ function runJsx(args) {
     }
 }
 
+// ───── Shared helpers for setTextLayers / addMarkers ─────
+
+// The comp to work on: the one given (compIndex, or compName - executeCommand turns compName
+// into compIndex), otherwise the active comp.
+function compFromArgs(args) {
+    if (args.compIndex) {
+        var item = app.project.item(args.compIndex);
+        if (!(item instanceof CompItem)) throw new Error("Item " + args.compIndex + " is not a composition.");
+        return item;
+    }
+    if (app.project.activeItem instanceof CompItem) return app.project.activeItem;
+    throw new Error("No composition given (compName or compIndex) and no composition is active.");
+}
+
+// Layers matching {layerIndex} or {layerName}, directly inside `comp` (not inside precomps).
+// A name can match several layers - all of them are returned.
+function findLayersBySpec(comp, spec) {
+    var found = [];
+    if (spec.layerIndex) {
+        if (spec.layerIndex <= comp.numLayers) found.push(comp.layer(spec.layerIndex));
+    } else if (spec.layerName !== undefined && spec.layerName !== null) {
+        for (var i = 1; i <= comp.numLayers; i++) {
+            if (comp.layer(i).name === spec.layerName) found.push(comp.layer(i));
+        }
+    }
+    return found;
+}
+
+function layerSpecLabel(spec) {
+    return spec.layerIndex ? ("layer #" + spec.layerIndex) : ("'" + spec.layerName + "'");
+}
+
+function padNumber(num, width) {
+    var s = String(num);
+    while (s.length < width) s = "0" + s;
+    return s;
+}
+
+// --- setTextLayers: set the text of text layers, keeping their font and style ---
+// args.jobs: [{ texts: [{layerName | layerIndex, text}], duplicate: bool, duplicateName: string }]
+// Each job works on the comp, or (duplicate: true) on a fresh duplicate of it - that's how a CSV
+// with one row per version becomes one comp per version. All jobs are a single undo step.
+function setLayerSourceText(layer, text) {
+    if (!(layer instanceof TextLayer)) return { error: "not a text layer" };
+    var prop = layer.property("ADBE Text Properties").property("ADBE Text Document");
+    // AE uses \r for line breaks inside text layers
+    var t = String(text).replace(/\r\n|\n/g, "\r");
+    if (prop.numKeys > 0) {
+        // Keyframed text: change the text in every keyframe, keep the keyframes themselves
+        for (var k = 1; k <= prop.numKeys; k++) {
+            var kd = prop.keyValue(k);
+            kd.text = t;
+            prop.setValueAtKey(k, kd);
+        }
+    } else {
+        var doc = prop.value;
+        doc.text = t;
+        prop.setValue(doc);
+    }
+    if (prop.expressionEnabled && prop.expression !== "") {
+        return { warning: "Source Text has an active expression, so what you see may not be this text" };
+    }
+    return {};
+}
+
+function setTextLayers(args) {
+    var source = compFromArgs(args);
+    var jobs = args.jobs || [];
+    if (jobs.length === 0) return JSON.stringify({ success: false, message: "Nothing to set (no texts given)." });
+
+    var results = [];
+    var totalChanged = 0;
+    app.beginUndoGroup("MCP: Set Text");
+    try {
+        for (var j = 0; j < jobs.length; j++) {
+            var job = jobs[j];
+            var comp = source;
+            if (job.duplicate) {
+                comp = source.duplicate();
+                comp.name = job.duplicateName ? String(job.duplicateName) : (source.name + "_" + padNumber(j + 1, 2));
+            }
+            var changed = [], notFound = [], skipped = [], warnings = [];
+            var texts = job.texts || [];
+            for (var t = 0; t < texts.length; t++) {
+                var layers = findLayersBySpec(comp, texts[t]);
+                if (layers.length === 0) { notFound.push(layerSpecLabel(texts[t])); continue; }
+                for (var l = 0; l < layers.length; l++) {
+                    var r = setLayerSourceText(layers[l], texts[t].text);
+                    if (r.error) { skipped.push(layers[l].name + " (" + r.error + ")"); continue; }
+                    changed.push(layers[l].name);
+                    if (r.warning) warnings.push(layers[l].name + ": " + r.warning);
+                }
+            }
+            totalChanged += changed.length;
+            var entry = { comp: comp.name, changed: changed };
+            if (notFound.length) entry.layersNotFound = notFound;
+            if (skipped.length) entry.skipped = skipped;
+            if (warnings.length) entry.warnings = warnings;
+            results.push(entry);
+        }
+    } finally {
+        app.endUndoGroup();
+    }
+
+    var message = "No text layers were changed - check the layer names.";
+    if (totalChanged > 0) {
+        message = "Set text on " + totalChanged + " layer(s)";
+        if (results.length > 1) message += " across " + results.length + " comps.";
+        else message += " in '" + results[0].comp + "'.";
+    }
+    return JSON.stringify({ success: totalChanged > 0, message: message, results: results });
+}
+
+// --- addMarkers: add markers to a comp, or to a layer when one is given ---
+// args.markers: [{ time (seconds) | frame, comment, duration, chapter, url, label (0-16) }]
+// No time and no frame = the current time indicator.
+function addMarkers(args) {
+    var comp = compFromArgs(args);
+    var markers = args.markers || [];
+    if (markers.length === 0) return JSON.stringify({ success: false, message: "No markers given." });
+
+    var targets = [];   // marker properties to add to
+    var targetLabel;
+    if (args.layerIndex || (args.layerName !== undefined && args.layerName !== null)) {
+        var layers = findLayersBySpec(comp, args);
+        if (layers.length === 0) return JSON.stringify({ success: false, message: "No layer " + layerSpecLabel(args) + " in '" + comp.name + "'." });
+        for (var i = 0; i < layers.length; i++) targets.push(layers[i].property("ADBE Marker"));
+        targetLabel = layers.length === 1 ? ("layer '" + layers[0].name + "'") : (layers.length + " layers named '" + args.layerName + "'");
+    } else {
+        if (!comp.markerProperty) return JSON.stringify({ success: false, message: "Comp markers need After Effects 2020 (17.1) or newer." });
+        targets.push(comp.markerProperty);
+        targetLabel = "comp '" + comp.name + "'";
+    }
+
+    var added = [];
+    app.beginUndoGroup("MCP: Add Markers");
+    try {
+        for (var m = 0; m < markers.length; m++) {
+            var spec = markers[m];
+            // Plain if/else on purpose: ExtendScript evaluates chained "a ? b : c ? d : e" wrongly
+            var time = comp.time;
+            if (spec.frame !== undefined && spec.frame !== null) time = spec.frame * comp.frameDuration;
+            else if (spec.time !== undefined && spec.time !== null) time = spec.time;
+            var mv = new MarkerValue(spec.comment ? String(spec.comment) : "");
+            if (spec.duration) mv.duration = spec.duration;
+            if (spec.chapter) mv.chapter = String(spec.chapter);
+            if (spec.url) mv.url = String(spec.url);
+            // MarkerValue.label exists from AE 2023 on; on older versions the color is just left default
+            if (spec.label !== undefined && spec.label !== null) { try { mv.label = spec.label; } catch (le) {} }
+            for (var t = 0; t < targets.length; t++) targets[t].setValueAtTime(time, mv);
+            added.push({ time: Math.round(time * 1000) / 1000, frame: Math.round(time / comp.frameDuration), comment: mv.comment });
+        }
+    } finally {
+        app.endUndoGroup();
+    }
+
+    return JSON.stringify({ success: true, message: "Added " + added.length + " marker(s) to " + targetLabel + ".", markers: added });
+}
+
+// --- saveIncrementalVersion: Name_v01.aep -> Name_v02.aep, test_01.aep -> test_02.aep ---
+// Like AE's own File > Increment and Save: the number at the end of the name goes up by one,
+// keeping its padding - whether it's a "v" version (v01 / v001 / V3) or a plain number (_01, " 7").
+// A name with no number at the end gets "_v01" (AE would add " 2").
+// Never overwrites: skips past any number that already exists in the folder. The open project
+// becomes the new file; the old version stays on disk exactly as it was last saved.
+function saveIncrementalVersion(args) {
+    var current = app.project.file;
+    if (!current) {
+        return JSON.stringify({ success: false, message: "This project has never been saved. Save it once by hand (File > Save As), then use incremental save." });
+    }
+    var folder = current.parent;
+    var fileName = File.decode(current.name);
+    var dot = fileName.lastIndexOf(".");
+    var base = dot > 0 ? fileName.substring(0, dot) : fileName;
+    var ext = dot > 0 ? fileName.substring(dot) : ".aep";
+
+    // stem = everything before the number (including any "v"), e.g. "Promo_v" or "test_"
+    var stem, version, width;
+    var match = /(\d+)$/.exec(base);
+    if (match) {
+        stem = base.substring(0, match.index);
+        version = parseInt(match[1], 10);
+        width = match[1].length;
+        // A one-digit "v" version is widened to two: "Promo V3" -> "Promo V04"
+        if (/(^|[^A-Za-z])[vV]$/.test(stem)) width = Math.max(width, 2);
+    } else {
+        stem = base + "_v";
+        version = 0;
+        width = 2;
+    }
+
+    var newFile;
+    do {
+        version++;
+        newFile = new File(folder.fsName + "/" + stem + padNumber(version, width) + ext);
+    } while (newFile.exists);
+
+    var ok = app.project.save(newFile);
+    if (ok === false) return JSON.stringify({ success: false, message: "After Effects could not save to " + newFile.fsName });
+
+    return JSON.stringify({
+        success: true,
+        message: "Saved as " + File.decode(newFile.name) + " (was " + fileName + ").",
+        previousFile: fileName,
+        newFile: File.decode(newFile.name),
+        path: newFile.fsName,
+        version: version
+    });
+}
+
 // --- setCompositionProperties: set duration, frameRate, etc. on active or named comp ---
 function setCompositionProperties(args) {
     try {
@@ -2082,6 +2292,15 @@ function executeCommand(command, args, commandId) {
                 result = setLayerMask(args);
                 logToPanel("Returned from setLayerMask.");
                 break;
+            case "setTextLayers":
+                result = setTextLayers(args);
+                break;
+            case "addMarkers":
+                result = addMarkers(args);
+                break;
+            case "saveIncrementalVersion":
+                result = saveIncrementalVersion(args);
+                break;
             case "runJsx":
                 logToPanel("Running jsx" + (args.file ? ": " + args.file : " code") + "...");
                 result = runJsx(args);
@@ -2181,11 +2400,13 @@ function executeCommand(command, args, commandId) {
 function updateCommandStatus(status) {
     try {
         var commandFile = new File(getCommandFilePath());
+        // The MCP server writes UTF-8; without this, non-English text (e.g. Hebrew) comes out garbled
+        commandFile.encoding = "UTF-8";
         if (commandFile.exists) {
             commandFile.open("r");
             var content = commandFile.read();
             commandFile.close();
-            
+
             if (content) {
                 var commandData = JSON.parse(content);
                 commandData.status = status;
@@ -2270,6 +2491,8 @@ function checkForCommands() {
 
     try {
         var commandFile = new File(getCommandFilePath());
+        // The MCP server writes UTF-8; without this, non-English text (e.g. Hebrew) comes out garbled
+        commandFile.encoding = "UTF-8";
         if (commandFile.exists) {
             commandFile.open("r");
             var content = commandFile.read();

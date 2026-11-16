@@ -421,6 +421,12 @@ Available scripts:
 - batchSetLayerProperties: Set properties across multiple layers at once
 - setCompositionProperties: Change settings on an existing composition
 
+Own tools (not run-script):
+- setText: Set the text of text layers, keeping font and style
+- setTextFromCSV: Fill text layers from a CSV (one row, or one duplicate comp per row)
+- addMarkers: Add markers to a comp or a layer
+- saveIncrementalVersion: Save the project as the next version (Name_v01.aep -> Name_v02.aep, test_01.aep -> test_02.aep)
+
 Effect Templates:
 - gaussian-blur: Simple Gaussian blur effect
 - directional-blur: Motion blur in a specific direction
@@ -694,6 +700,167 @@ server.tool(
         ],
         isError: true
       };
+    }
+  }
+);
+
+// ───── Text, markers, incremental save ─────
+
+// Read a CSV into rows of cells. Handles quoted cells (with commas / line breaks inside), a UTF-8
+// BOM, and comma / semicolon / tab separators (picked from the header line). Excel on a Hebrew
+// Windows machine saves plain "CSV" as Windows-1255, not UTF-8 - that's detected and decoded too.
+function readCSV(filePath: string): string[][] {
+  const bytes = fs.readFileSync(filePath);
+  let text = new TextDecoder('utf-8').decode(bytes);
+  if (text.includes('�')) {
+    try { text = new TextDecoder('windows-1255').decode(bytes); } catch { /* keep the UTF-8 reading */ }
+  }
+  text = text.replace(/^﻿/, '');
+
+  const headerLine = text.split(/\r?\n/)[0] || '';
+  const delimiter = [',', ';', '\t']
+    .map(d => ({ d, count: headerLine.split(d).length }))
+    .sort((a, b) => b.count - a.count)[0].d;
+
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') inQuotes = false;
+      else cell += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === delimiter) { row.push(cell); cell = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += ch;
+  }
+  if (cell !== '' || row.length > 0) { row.push(cell); rows.push(row); }
+  // Drop fully empty lines (e.g. the blank line Excel leaves at the end)
+  return rows.filter(r => r.some(c => c.trim() !== ''));
+}
+
+const TextTargetSchema = z.object({
+  layerName: z.string().optional().describe("The text layer's exact name (every layer with this name is set)."),
+  layerIndex: z.number().int().positive().optional().describe("1-based layer index, instead of layerName."),
+  text: z.string().describe("The new text. Use \\n for a line break.")
+});
+
+server.tool(
+  "setText",
+  "Set the text of one or more text layers in a composition, keeping each layer's font and style. " +
+  "Layers are found by name (all layers with that name) or index, directly inside the comp - not inside precomps. " +
+  "Keyframed Source Text gets the new text in every keyframe. All changes are one undo step. " +
+  "Uses the active comp if no comp is given.",
+  {
+    ...CompIdentifierSchema,
+    texts: z.array(TextTargetSchema).min(1).describe("Which layers to set, and their new text.")
+  },
+  async ({ compIndex, compName, texts }) => {
+    try {
+      return bridgeReply(await runBridge("setTextLayers", { compIndex, compName, jobs: [{ texts }] }));
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running setText: ${String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "setTextFromCSV",
+  "Fill text layers from a CSV file. The CSV's header row holds text layer names; each row below is one version. " +
+  "With `row`, that one row's text goes into the comp itself. With `allRows`, the comp is duplicated once per row " +
+  "and each copy gets that row's text (named from `nameColumn`, or '<comp>_01', '_02', …). Empty cells leave the " +
+  "layer as it is. Note: duplicating a comp does not duplicate the precomps inside it, so only text layers directly " +
+  "in the comp change per version. Uses the active comp if no comp is given.",
+  {
+    csvPath: z.string().describe("Absolute path of the .csv file."),
+    ...CompIdentifierSchema,
+    row: z.number().int().positive().optional().describe("Which data row to use (1 = the first row under the header). Default 1."),
+    allRows: z.boolean().optional().describe("Make one duplicate comp per row instead of changing the comp itself."),
+    nameColumn: z.string().optional().describe("Header of a column that names each duplicate comp (that column is not used as text).")
+  },
+  async ({ csvPath, compIndex, compName, row, allRows, nameColumn }) => {
+    try {
+      if (!fs.existsSync(csvPath)) return { content: [{ type: "text", text: `No such file: ${csvPath}` }], isError: true };
+      const rows = readCSV(csvPath);
+      if (rows.length < 2) return { content: [{ type: "text", text: "The CSV needs a header row (layer names) and at least one row of text." }], isError: true };
+      const header = rows[0].map(h => h.trim());
+      const data = rows.slice(1);
+      if (nameColumn && !header.includes(nameColumn))
+        return { content: [{ type: "text", text: `No column '${nameColumn}' in the CSV. Columns: ${header.join(', ')}` }], isError: true };
+
+      const textsFor = (cells: string[]) => header
+        .map((layerName, i) => ({ layerName, text: cells[i] ?? '' }))
+        .filter(t => t.layerName !== '' && t.layerName !== nameColumn && t.text.trim() !== '');
+
+      let jobs;
+      if (allRows) {
+        const nameIdx = nameColumn ? header.indexOf(nameColumn) : -1;
+        jobs = data.map(cells => ({
+          duplicate: true,
+          duplicateName: nameIdx >= 0 && cells[nameIdx]?.trim() ? cells[nameIdx].trim() : undefined,
+          texts: textsFor(cells)
+        }));
+      } else {
+        const r = row ?? 1;
+        if (r > data.length) return { content: [{ type: "text", text: `Row ${r} doesn't exist: the CSV has ${data.length} data row(s).` }], isError: true };
+        jobs = [{ texts: textsFor(data[r - 1]) }];
+      }
+
+      // Duplicating many comps takes a while: allow more time for big CSVs
+      const timeoutMs = Math.min(30000 + jobs.length * 2000, 600000);
+      return bridgeReply(await runBridge("setTextLayers", { compIndex, compName, jobs }, timeoutMs));
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running setTextFromCSV: ${String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "addMarkers",
+  "Add one or more markers to a composition, or to a layer if layerName / layerIndex is given. " +
+  "Each marker's time is in seconds (`time`) or frames (`frame`); with neither, it goes at the current time indicator. " +
+  "All markers are one undo step. Uses the active comp if no comp is given.",
+  {
+    ...CompIdentifierSchema,
+    layerName: z.string().optional().describe("Put the markers on this layer (every layer with this name) instead of the comp."),
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index, instead of layerName."),
+    markers: z.array(z.object({
+      time: z.number().optional().describe("Time in seconds (comp time)."),
+      frame: z.number().int().nonnegative().optional().describe("Time in frames, instead of seconds."),
+      comment: z.string().optional().describe("The marker's text."),
+      duration: z.number().nonnegative().optional().describe("Length in seconds (0 = a single-frame marker)."),
+      chapter: z.string().optional().describe("Chapter name (for exported video)."),
+      url: z.string().optional().describe("Web link."),
+      label: z.number().int().min(0).max(16).optional().describe("Color label number, as in AE's Label menu (0 = none). AE 2023 or newer.")
+    })).min(1).describe("The markers to add.")
+  },
+  async (parameters) => {
+    try {
+      return bridgeReply(await runBridge("addMarkers", parameters));
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running addMarkers: ${String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "saveIncrementalVersion",
+  "Save the open project as the next version, like AE's File > Increment and Save: the number at the end of the name " +
+  "goes up by one, keeping its padding ('Promo_v01.aep' -> 'Promo_v02.aep', 'test_01.aep' -> 'test_02.aep'). " +
+  "A name with no number at the end gets '_v01'. Never overwrites - skips past versions that already " +
+  "exist in the folder. The open project becomes the new file; the previous version stays on disk as it was last saved. " +
+  "The project must have been saved at least once.",
+  {},
+  async () => {
+    try {
+      return bridgeReply(await runBridge("saveIncrementalVersion", {}, 120000));
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running saveIncrementalVersion: ${String(error)}` }], isError: true };
     }
   }
 );
