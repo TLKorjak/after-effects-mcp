@@ -11,6 +11,10 @@
   <img width="380" height="200" src="https://glama.ai/mcp/servers/@Dakkshin/after-effects-mcp/badge" alt="mcp-after-effects MCP server" />
 </a>
 
+> **This fork:** every tool now returns its own result in one call, comps can be given by name, and two new tools,
+> `run-jsx` (any ExtendScript) and `run-skill-script` (the `after-effects` skill's scripts), cover one-off work.
+> What changed, why, test results and pros/cons: [docs/SKILL-TOOLS-IN-MCP.md](docs/SKILL-TOOLS-IN-MCP.md).
+
 ## Table of Contents
 - [Features](#features)
   - [Core Composition Features](#core-composition-features)
@@ -141,6 +145,10 @@ Go to your client (e.g., Claude or Cursor) and update your config file:
    - The panel will automatically check for commands every few seconds
    - Make sure the "Auto-run commands" checkbox is enabled
 
+4. **After changing the code**
+   - `npm run build && npm run install-bridge`, then reload the panel in After Effects (its reload link)
+   - When `src/index.ts` changed, reconnect the MCP server in your client (in Claude Code: `/mcp`)
+
 ## 🚀 Usage Guide
 
 Once you have the server running and the MCP Bridge panel open in After Effects, you can control After Effects through the MCP protocol. This allows AI assistants or custom applications to send commands to After Effects.
@@ -199,11 +207,20 @@ You can animate layers with:
 
 ## 🛠 Available MCP Tools
 
+Every tool queues its command, the panel runs it, and the tool returns that command's own result (matched by a
+command id). Tools that take `compIndex` (the comp's item number in the project panel, which `listCompositions` shows)
+also take `compName`.
+
 | Command                     | Description                            |
 |-----------------------------|----------------------------------------|
+| `run-jsx`                   | Run any ExtendScript (code or a .jsx file) and return its result; `undoName` = one undo step |
+| `run-skill-script`          | Run one of the `after-effects` skill's scripts (project-overview, comp-detail, expression-errors …) with args |
+| `getEssentialGraphics`      | List a comp's Essential Graphics properties |
+| `getLayerExpressions`       | List a layer's expressions and errors (empty Layer Styles left out unless `all`) |
+| `getExpressionErrors`       | Scan the project, a comp or a layer for expression errors |
 | `create-composition`        | Create a new composition               |
-| `run-script`                | Run a JS script inside AE              |
-| `get-results`               | Get script results                     |
+| `run-script`                | Run one of the predefined scripts      |
+| `get-results`               | The last result (only for a command that timed out) |
 | `get-help`                  | Help for available commands            |
 | `setLayerKeyframe`          | Add keyframe to layer property         |
 | `setLayerExpression`        | Add/remove expressions from properties|
@@ -223,6 +240,7 @@ You can animate layers with:
 - `src/index.ts`: MCP server implementation
 - `src/scripts/mcp-bridge-auto.jsx`: Main After Effects panel script
 - `install-bridge.js`: Script to install the panel in After Effects
+- `docs/SKILL-TOOLS-IN-MCP.md`: command ids, `compName`, `run-jsx`, `run-skill-script` (2026-11-16)
 
 ### 📦 Building the Project
 

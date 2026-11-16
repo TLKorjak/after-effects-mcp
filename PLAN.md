@@ -40,7 +40,13 @@ Based on this session's actual recurring needs, add new MCP tools (as new `src/s
 - **Expression error querying**: a tool that surfaces `property.expressionError` for a given property/layer/comp scope, mirroring the existing skill's `expression-errors.jsx` query script (`~/.agents/skills/after-effects/scripts/expression-errors.jsx`) — reuse that script's logic rather than reinventing it.
 - Any other gaps that surface once real usage starts (project-overview-style comp/folder summaries, font inventory, etc. — the existing skill's `scripts/*.jsx` files are a ready-made reference for porting logic over, since they already encode the ES3/utils.jsx conventions this project also needs).
 
+**Progress (2026-11-16, branch `skill-tools-in-mcp`):** Essential Graphics and expression-error tools are in. Instead of
+porting the skill's scripts one by one, `run-skill-script` runs any of them through the panel, and `run-jsx` runs any
+ExtendScript. Every tool now returns its own result (command ids), and comps can be given by name. Details:
+[docs/SKILL-TOOLS-IN-MCP.md](docs/SKILL-TOOLS-IN-MCP.md).
+
 ### 4. Retire (or keep as fallback) the old `after-effects` skill workflow
+**In trial since 2026-11-16:** the MCP is the first route for AE work in Claude Code, the skill the fallback.
 Once the MCP bridge is confirmed working end-to-end for the core operations (query comp/layer/effect state, apply/edit expressions), stop using the osascript-based skill as the primary path. Keep it documented as a fallback for anything the MCP tool set doesn't cover yet (e.g. truly one-off diagnostic scripts), rather than deleting it outright.
 
 ### 5. Update `adobe-dev/CLAUDE.md`

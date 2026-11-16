@@ -1019,7 +1019,7 @@ function setLayerExpression(compIndex, layerIndex, propertyName, expressionStrin
  * @param {number} layerIndex - The index of the layer within the composition (1-based).
  * @returns {string} JSON string with the layer's expression-capable properties.
  */
-function getLayerExpressions(compIndex, layerIndex) {
+function getLayerExpressions(compIndex, layerIndex, all) {
     try {
         var comp = app.project.items[compIndex];
         if (!comp || !(comp instanceof CompItem)) {
@@ -1057,6 +1057,18 @@ function getLayerExpressions(compIndex, layerIndex) {
         }
 
         walk(layer, "");
+        // Without `all`: Layer Styles, Geometry Options and Audio only when one of them has an expression
+        if (!all) {
+            var kept = [], skipped = 0;
+            for (var k = 0; k < properties.length; k++) {
+                var pr = properties[k];
+                if (!pr.hasExpression && /^(Layer Styles|Geometry Options|Audio)( >|$)/.test(pr.path)) { skipped++; continue; }
+                kept.push(pr);
+            }
+            properties = kept;
+            if (skipped) return JSON.stringify({ success: true, layer: layer.name, properties: properties,
+                                                 note: skipped + " Layer Styles / Geometry Options / Audio properties without expressions left out (all: true lists them)" });
+        }
 
         return JSON.stringify({ success: true, layer: layer.name, properties: properties });
     } catch (e) {
@@ -1732,6 +1744,43 @@ function getResultFilePath() {
     return bridgeFolder.fsName + "/ae_mcp_result.json";
 }
 
+// The time as "2026-11-16T09:30:00Z". ExtendScript (ES3) has no Date.toISOString: calling it threw,
+// so results never got their timestamp / command name before.
+function isoNow() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? "0" : "") + n; }
+    return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) + "T" +
+           p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + "Z";
+}
+
+// --- runJsx: any ExtendScript. args.code: the body of a function(args) that returns plain data;
+// or args.file: a .jsx file run with $.evalFile (its last value is the result; a file written for the
+// after-effects skill writes /tmp/ae-assistant-result.json, which the MCP server reads back).
+// args.undoName: all of it as one undo step. ---
+function runJsx(args) {
+    var undo = args.undoName ? String(args.undoName) : "";
+    if (undo) app.beginUndoGroup(undo);
+    try {
+        var value;
+        if (args.file) {
+            var f = new File(args.file);
+            if (!f.exists) return JSON.stringify({ success: false, message: "No such file: " + args.file });
+            value = $.evalFile(f);
+        } else {
+            var fn = new Function("args", String(args.code || ""));
+            value = fn(args.args || {});
+        }
+        var out;
+        try { out = JSON.stringify({ success: true, result: (value === undefined ? null : value) }); }
+        catch (se) { out = JSON.stringify({ success: true, result: String(value), note: "The value isn't plain data, so it came back as text." }); }
+        return out;
+    } catch (e) {
+        return JSON.stringify({ success: false, message: e.toString(), line: e.line });
+    } finally {
+        if (undo) app.endUndoGroup();
+    }
+}
+
 // --- setCompositionProperties: set duration, frameRate, etc. on active or named comp ---
 function setCompositionProperties(args) {
     try {
@@ -1841,6 +1890,8 @@ function listCompositions() {
         // Check if the item is a composition
         if (item instanceof CompItem) {
             result.compositions.push({
+                index: i,   // the item number: what the tools' compIndex means
+                folder: (item.parentFolder && item.parentFolder !== project.rootFolder) ? item.parentFolder.name : "",
                 id: item.id,
                 name: item.name,
                 duration: item.duration,
@@ -1890,7 +1941,7 @@ function getLayerInfo() {
 }
 
 // Execute command
-function executeCommand(command, args) {
+function executeCommand(command, args, commandId) {
     var result = "";
 
     logToPanel("Executing command: " + command);
@@ -1902,6 +1953,13 @@ function executeCommand(command, args) {
     });
 
     try {
+        // A comp given by name (compName) instead of its item number (compIndex)
+        if (args && args.compName && !args.compIndex) {
+            for (var ci = 1; ci <= app.project.numItems; ci++) {
+                if (app.project.item(ci) instanceof CompItem && app.project.item(ci).name === args.compName) { args.compIndex = ci; break; }
+            }
+            if (!args.compIndex) throw new Error("No composition named '" + args.compName + "'");
+        }
         logToPanel("Attempting to execute: " + command); // Log before switch
         // Use a switch statement for clarity
         switch (command) {
@@ -1956,7 +2014,7 @@ function executeCommand(command, args) {
                 break;
             case "getLayerExpressions":
                 logToPanel("Calling getLayerExpressions function...");
-                result = getLayerExpressions(args.compIndex, args.layerIndex);
+                result = getLayerExpressions(args.compIndex, args.layerIndex, args.all);
                 logToPanel("Returned from getLayerExpressions.");
                 break;
             case "getExpressionErrors":
@@ -2024,6 +2082,11 @@ function executeCommand(command, args) {
                 result = setLayerMask(args);
                 logToPanel("Returned from setLayerMask.");
                 break;
+            case "runJsx":
+                logToPanel("Running jsx" + (args.file ? ": " + args.file : " code") + "...");
+                result = runJsx(args);
+                logToPanel("Returned from runJsx.");
+                break;
             default:
                 result = JSON.stringify({ error: "Unknown command: " + command });
         }
@@ -2037,14 +2100,15 @@ function executeCommand(command, args) {
         try {
             var resultObj = JSON.parse(resultString);
             // Add a timestamp to help identify if we're getting fresh results
-            resultObj._responseTimestamp = new Date().toISOString();
+            resultObj._responseTimestamp = isoNow();
             resultObj._commandExecuted = command;
+            if (commandId) resultObj._commandId = commandId;
             resultString = JSON.stringify(resultObj, null, 2);
             logToPanel("Added timestamp to result JSON for tracking freshness.");
         } catch (parseError) {
-            // If it's not valid JSON, append the timestamp as a comment
+            // Not JSON: wrapped, so the result still carries the command's id
             logToPanel("Could not parse result as JSON to add timestamp: " + parseError.toString());
-            // We'll still continue with the original string
+            resultString = JSON.stringify({ raw: resultString, _commandExecuted: command, _commandId: commandId || "", _responseTimestamp: isoNow() });
         }
         
         var resultFile = new File(getResultFilePath());
@@ -2088,6 +2152,7 @@ function executeCommand(command, args) {
             var errorResult = JSON.stringify({ 
                 status: "error", 
                 command: command,
+                _commandId: commandId || "",
                 message: error.toString(),
                 line: error.line,
                 fileName: error.fileName
@@ -2198,7 +2263,7 @@ function checkForCommands() {
                     updateCommandStatus("running");
 
                     // Execute the command
-                    executeCommand(commandData.command, commandData.args || {});
+                    executeCommand(commandData.command, commandData.args || {}, commandData.id);
                 }
             }
         }
