@@ -104,21 +104,72 @@ async function waitForBridgeResult(expectedCommand?: string, timeoutMs: number =
   return JSON.stringify({ error: `Timed out waiting for bridge result${expectedCommand ? ` for command '${expectedCommand}'` : ''}.` });
 }
 
-// Helper function to write command to file
-function writeCommandFile(command: string, args: Record<string, any> = {}): void {
+// Helper function to write command to file. Returns the command's id: the panel copies it into the
+// result (_commandId), so runBridge can tell this command's result from an older one.
+function writeCommandFile(command: string, args: Record<string, any> = {}): string {
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     const commandFile = path.join(getAETempDir(), 'ae_command.json');
     const commandData = {
+      id,
       command,
       args,
       timestamp: new Date().toISOString(),
       status: "pending"  // pending, running, completed, error
     };
     fs.writeFileSync(commandFile, JSON.stringify(commandData, null, 2));
-    console.error(`Command "${command}" written to ${commandFile}`);
+    console.error(`Command "${command}" (${id}) written to ${commandFile}`);
   } catch (error) {
     console.error("Error writing command file:", error);
   }
+  return id;
+}
+
+// ───── Run a command and wait for its own result ─────
+// The panel in After Effects picks the command up (every 2 s), runs it and writes the result with the
+// command's id. One command at a time: the command file has one slot, so calls are queued here.
+const BRIDGE_TIMEOUT_MS = 30000;
+let bridgeQueue: Promise<unknown> = Promise.resolve();
+
+function runBridge(command: string, args: Record<string, any> = {}, timeoutMs: number = BRIDGE_TIMEOUT_MS): Promise<string> {
+  const run = async (): Promise<string> => {
+    const id = writeCommandFile(command, args);
+    const resultPath = path.join(getAETempDir(), 'ae_mcp_result.json');
+    const commandPath = path.join(getAETempDir(), 'ae_command.json');
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const content = fs.readFileSync(resultPath, 'utf8');
+        const parsed = JSON.parse(content);
+        if (parsed && parsed._commandId === id) return content;
+      } catch {
+        // not there yet, or being written: try again
+      }
+      await new Promise(r => setTimeout(r, 150));
+    }
+    // Timed out: say why, from the command's status (still "pending" = the panel never picked it up)
+    let status = '';
+    try { status = JSON.parse(fs.readFileSync(commandPath, 'utf8')).status || ''; } catch { /* no command file */ }
+    const hint = status === 'pending'
+      ? 'After Effects did not pick the command up: is the "MCP Bridge Auto" panel open (Window > mcp-bridge-auto.jsx) with Auto-run on? If the panel was updated, click its reload link.'
+      : status === 'running'
+        ? 'After Effects is still running it (a long script, or a dialog open in AE?). Use get-results later.'
+        : 'No result with this command id (an old panel version that does not return command ids? Reload the panel).';
+    return JSON.stringify({ error: `Timed out after ${Math.round(timeoutMs / 1000)} s waiting for '${command}'.`, hint, commandId: id, commandStatus: status });
+  };
+  const next = bridgeQueue.then(run, run);
+  bridgeQueue = next.catch(() => undefined);
+  return next;
+}
+
+// A tool's reply from a bridge result: the result text, marked as an error when it is one
+function bridgeReply(result: string) {
+  let isError = false;
+  try {
+    const r = JSON.parse(result);
+    isError = r.error !== undefined || r.success === false || r.status === 'error';
+  } catch { /* not JSON: plain text */ }
+  return { content: [{ type: "text" as const, text: result }], ...(isError ? { isError: true } : {}) };
 }
 
 // Helper function to clear the results file to avoid stale cache
@@ -146,9 +197,7 @@ server.resource(
   "aftereffects://compositions",
   async (uri) => {
     // Clear old results, queue the command, and wait for bridge output
-    clearResultsFile();
-    writeCommandFile("listCompositions", {});
-    const result = await waitForBridgeResult("listCompositions", 6000, 250);
+    const result = await runBridge("listCompositions", {});
 
     return {
       contents: [{
@@ -212,22 +261,9 @@ server.tool(
     }
 
     try {
-      // Clear any stale result data
-      clearResultsFile();
-      
       // Write command to file for After Effects to pick up
-      writeCommandFile(script, parameters);
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to run "${script}" has been queued.\n` +
-                  `Please ensure the "MCP Bridge Auto" panel is open in After Effects.\n` +
-                  `Use the "get-results" tool after a few seconds to check for results.`
-          }
-        ]
-      };
+      const result = await runBridge(script, parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -350,14 +386,14 @@ To use this integration with After Effects, follow these steps:
    - In After Effects, go to Window > mcp-bridge-auto.jsx
    - The panel will automatically check for commands every few seconds
 
-4. **Run scripts through MCP**
-   - Use the \`run-script\` tool to queue a command
-   - The Auto panel will detect and run the command automatically
-   - Results will be saved to a temp file
+4. **Run commands through MCP**
+   - Every tool queues its command, the panel runs it, and the tool waits for that command's own result
+     (matched by a command id) and returns it. No separate get-results step.
+   - Comps can be given by \`compName\` instead of \`compIndex\` (the item number in the project panel).
+   - \`run-jsx\`: any ExtendScript (code or a .jsx file). \`run-skill-script\`: the after-effects skill's scripts.
 
-5. **Get results through MCP**
-   - After a command is executed, use the \`get-results\` tool
-   - This will retrieve the results from After Effects
+5. **get-results**
+   - Only for a command that timed out (a long script): returns the last result written.
 
 Available scripts:
 - getProjectInfo: Information about the current project
@@ -423,18 +459,8 @@ server.tool(
   async (params) => {
     try {
       // Write command to file for After Effects to pick up
-      writeCommandFile("createComposition", params);
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to create composition "${params.name}" has been queued.\n` +
-                  `Please ensure the "MCP Bridge Auto" panel is open in After Effects.\n` +
-                  `Use the "get-results" tool after a few seconds to check for results.`
-          }
-        ]
-      };
+      const result = await runBridge("createComposition", params);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -453,7 +479,8 @@ server.tool(
 
 // Zod schema for common layer identification
 const LayerIdentifierSchema = {
-  compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel."),
+  compIndex: z.number().int().positive().optional().describe("1-based index of the composition in the project panel (its item number, folders and footage included; listCompositions shows it). Or give compName."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex (the first comp with that name)."),
   layerIndex: z.number().int().positive().describe("1-based index of the target layer within the composition.")
 };
 
@@ -474,17 +501,8 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("setLayerKeyframe", parameters);
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to set keyframe for "${parameters.propertyName}" on layer ${parameters.layerIndex} in comp ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for confirmation.`
-          }
-        ]
-      };
+      const result = await runBridge("setLayerKeyframe", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -515,17 +533,8 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("setLayerExpression", parameters);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to set expression for "${parameters.propertyName}" on layer ${parameters.layerIndex} in comp ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for confirmation.`
-          }
-        ]
-      };
+      const result = await runBridge("setLayerExpression", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -545,23 +554,16 @@ server.tool(
   "getLayerExpressions",
   "List every expression-capable property on a layer (transform, effects, text, masks, etc.) along with its " +
   "current expression text, enabled state, and expressionError if any. Use this to discover what can be targeted " +
-  "with setLayerExpression, or to check/fix an expression that's already applied.",
+  "with setLayerExpression, or to check/fix an expression that's already applied. Layer Styles, Geometry Options and " +
+  "Audio properties without expressions are left out unless all is true.",
   {
-    ...LayerIdentifierSchema
+    ...LayerIdentifierSchema,
+    all: z.boolean().optional().describe("Also list the Layer Styles / Geometry Options / Audio properties that have no expression.")
   },
   async (parameters) => {
     try {
-      writeCommandFile("getLayerExpressions", parameters);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to list expressions on layer ${parameters.layerIndex} in comp ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for results.`
-          }
-        ]
-      };
+      const result = await runBridge("getLayerExpressions", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -583,22 +585,14 @@ server.tool(
   "or a single layer. Use scope 'project' for a broad audit, or 'comp'/'layer' to narrow down while fixing something specific.",
   {
     scope: z.enum(["project", "comp", "layer"]).default("project").describe("How broadly to scan."),
-    compIndex: z.number().int().positive().optional().describe("1-based composition index. Required for scope 'comp' or 'layer'."),
+    compIndex: z.number().int().positive().optional().describe("1-based composition index. Required for scope 'comp' or 'layer' (or give compName)."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex."),
     layerIndex: z.number().int().positive().optional().describe("1-based layer index within the composition. Required for scope 'layer'.")
   },
   async (parameters) => {
     try {
-      writeCommandFile("getExpressionErrors", parameters);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to scan expression errors (scope: ${parameters.scope}) has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for results.`
-          }
-        ]
-      };
+      const result = await runBridge("getExpressionErrors", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -615,7 +609,8 @@ server.tool(
 
 // Zod schema for identifying a composition (Essential Graphics tools operate at the comp level)
 const CompIdentifierSchema = {
-  compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel.")
+  compIndex: z.number().int().positive().optional().describe("1-based index of the composition in the project panel (its item number, folders and footage included; listCompositions shows it). Or give compName."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex (the first comp with that name).")
 };
 
 // Tool for adding a layer property to the Essential Graphics panel
@@ -633,17 +628,8 @@ server.tool(
   },
   async (parameters) => {
     try {
-      writeCommandFile("addToEssentialGraphics", parameters);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to add "${parameters.propertyName}" on layer ${parameters.layerIndex} in comp ${parameters.compIndex} to Essential Graphics has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for confirmation.`
-          }
-        ]
-      };
+      const result = await runBridge("addToEssentialGraphics", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -667,17 +653,8 @@ server.tool(
   },
   async (parameters) => {
     try {
-      writeCommandFile("getEssentialGraphics", parameters);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to list Essential Graphics for comp ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for results.`
-          }
-        ]
-      };
+      const result = await runBridge("getEssentialGraphics", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -705,17 +682,8 @@ server.tool(
   },
   async (parameters) => {
     try {
-      writeCommandFile("setEssentialGraphicsProperty", parameters);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to update Essential Graphics for comp ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for confirmation.`
-          }
-        ]
-      };
+      const result = await runBridge("setEssentialGraphicsProperty", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -853,7 +821,8 @@ server.tool(
   "apply-effect",
   "Apply an effect to a layer in After Effects",
   {
-    compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel."),
+    compIndex: z.number().int().positive().optional().describe("1-based index of the composition in the project panel (its item number, folders and footage included; listCompositions shows it). Or give compName."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex (the first comp with that name)."),
     layerIndex: z.number().int().positive().describe("1-based index of the target layer within the composition."),
     effectName: z.string().optional().describe("Display name of the effect to apply (e.g., 'Gaussian Blur')."),
     effectMatchName: z.string().optional().describe("After Effects internal name for the effect (more reliable, e.g., 'ADBE Gaussian Blur 2')."),
@@ -864,17 +833,8 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffect", parameters);
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to apply effect to layer ${parameters.layerIndex} in composition ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for confirmation.`
-          }
-        ]
-      };
+      const result = await runBridge("applyEffect", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -894,7 +854,8 @@ server.tool(
   "apply-effect-template",
   "Apply a predefined effect template to a layer in After Effects",
   {
-    compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel."),
+    compIndex: z.number().int().positive().optional().describe("1-based index of the composition in the project panel (its item number, folders and footage included; listCompositions shows it). Or give compName."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex (the first comp with that name)."),
     layerIndex: z.number().int().positive().describe("1-based index of the target layer within the composition."),
     templateName: z.enum([
       "gaussian-blur", 
@@ -912,17 +873,8 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffectTemplate", parameters);
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Command to apply effect template '${parameters.templateName}' to layer ${parameters.layerIndex} in composition ${parameters.compIndex} has been queued.\n` +
-                  `Use the "get-results" tool after a few seconds to check for confirmation.`
-          }
-        ]
-      };
+      const result = await runBridge("applyEffectTemplate", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -944,7 +896,8 @@ server.tool(
   "mcp_aftereffects_applyEffect",
   "Apply an effect to a layer in After Effects",
   {
-    compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel."),
+    compIndex: z.number().int().positive().optional().describe("1-based index of the composition in the project panel (its item number, folders and footage included; listCompositions shows it). Or give compName."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex (the first comp with that name)."),
     layerIndex: z.number().int().positive().describe("1-based index of the target layer within the composition."),
     effectName: z.string().optional().describe("Display name of the effect to apply (e.g., 'Gaussian Blur')."),
     effectMatchName: z.string().optional().describe("After Effects internal name for the effect (more reliable, e.g., 'ADBE Gaussian Blur 2')."),
@@ -953,22 +906,8 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffect", parameters);
-      
-      // Wait a bit for After Effects to process the command
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Get the results
-      const result = readResultsFromTempFile();
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: result
-          }
-        ]
-      };
+      const result = await runBridge("applyEffect", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -988,7 +927,8 @@ server.tool(
   "mcp_aftereffects_applyEffectTemplate",
   "Apply a predefined effect template to a layer in After Effects",
   {
-    compIndex: z.number().int().positive().describe("1-based index of the target composition in the project panel."),
+    compIndex: z.number().int().positive().optional().describe("1-based index of the composition in the project panel (its item number, folders and footage included; listCompositions shows it). Or give compName."),
+    compName: z.string().optional().describe("The composition's exact name, instead of compIndex (the first comp with that name)."),
     layerIndex: z.number().int().positive().describe("1-based index of the target layer within the composition."),
     templateName: z.enum([
       "gaussian-blur", 
@@ -1006,22 +946,8 @@ server.tool(
   async (parameters) => {
     try {
       // Queue the command for After Effects
-      writeCommandFile("applyEffectTemplate", parameters);
-      
-      // Wait a bit for After Effects to process the command
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Get the results
-      const result = readResultsFromTempFile();
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: result
-          }
-        ]
-      };
+      const result = await runBridge("applyEffectTemplate", parameters);
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -1128,22 +1054,9 @@ server.tool(
   {},
   async () => {
     try {
-      // Clear any stale result data
-      clearResultsFile();
-      
       // Write command to file for After Effects to pick up
-      writeCommandFile("bridgeTestEffects", {});
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Bridge test effects command has been queued.\n` +
-                  `Please ensure the "MCP Bridge Auto" panel is open in After Effects.\n` +
-                  `Use the "get-results" tool after a few seconds to check for the test results.`
-          }
-        ]
-      };
+      const result = await runBridge("bridgeTestEffects", {});
+      return bridgeReply(result);
     } catch (error) {
       return {
         content: [
@@ -1154,6 +1067,96 @@ server.tool(
         ],
         isError: true
       };
+    }
+  }
+);
+
+// ───── Any ExtendScript, and the after-effects skill's scripts ─────
+// run-jsx runs code (or a .jsx file) inside After Effects through the panel. A file written for the
+// after-effects skill (readArgs() / writeResult() in lib/utils.jsx) works as is: its args go to
+// /tmp/ae-assistant-args.json and its /tmp/ae-assistant-result.json comes back as the result.
+const SKILL_ARGS_FILE = '/tmp/ae-assistant-args.json';
+const SKILL_RESULT_FILE = '/tmp/ae-assistant-result.json';
+
+function skillScriptsDir(): string | null {
+  const candidates = [path.join(os.homedir(), '.claude', 'skills', 'after-effects', 'scripts'),
+                      path.join(os.homedir(), '.agents', 'skills', 'after-effects', 'scripts')];
+  for (const c of candidates) {
+    try { return fs.realpathSync(c); } catch { /* not there */ }   // the real path: #include can't follow symlinks
+  }
+  return null;
+}
+function skillScriptNames(): string[] {
+  const dir = skillScriptsDir();
+  if (!dir) return [];
+  try { return fs.readdirSync(dir).filter(f => f.endsWith('.jsx') && f !== 'ae-action.jsx').map(f => f.replace(/\.jsx$/, '')).sort(); }
+  catch { return []; }
+}
+
+async function runJsx(opts: { code?: string; file?: string; args?: Record<string, unknown>; undoName?: string; timeoutSeconds?: number }): Promise<string> {
+  if (!opts.code && !opts.file) return JSON.stringify({ error: 'Give code or file.' });
+  if (opts.file && !fs.existsSync(opts.file)) return JSON.stringify({ error: `No such file: ${opts.file}` });
+  // For skill-style files: their args, and no old result lying around
+  try { fs.writeFileSync(SKILL_ARGS_FILE, JSON.stringify(opts.args || {})); } catch { /* not needed for code */ }
+  try { fs.rmSync(SKILL_RESULT_FILE, { force: true }); } catch { /* none */ }
+  const timeout = Math.min(Math.max(opts.timeoutSeconds || 60, 5), 600) * 1000;
+  const raw = await runBridge('runJsx', { code: opts.code || '', file: opts.file || '', args: opts.args || {}, undoName: opts.undoName || '' }, timeout);
+  // A skill-style script answered in its own result file: that is the result
+  try {
+    const r = JSON.parse(raw);
+    if (r.success !== false && !r.error && fs.existsSync(SKILL_RESULT_FILE)) {
+      const text = fs.readFileSync(SKILL_RESULT_FILE, 'utf8');
+      try { return JSON.stringify(JSON.parse(text), null, 1); } catch { return text; }
+    }
+  } catch { /* plain text */ }
+  return raw;
+}
+
+server.tool(
+  "run-jsx",
+  "Run ExtendScript (ES3) inside After Effects and return its result. Give `code`: the body of a function that gets `args` " +
+  "and returns plain data (numbers, strings, arrays, plain objects - not AE objects), e.g. " +
+  "\"var c = app.project.activeItem; return { name: c.name, layers: c.numLayers };\". Or give `file`: a .jsx file to run " +
+  "($.evalFile); a file written for the after-effects skill (readArgs/writeResult) gets `args` and its result back. " +
+  "It can change the project: give `undoName` to make the changes one undo step.",
+  {
+    code: z.string().optional().describe("ExtendScript function body; `args` is available; `return` the result."),
+    file: z.string().optional().describe("Absolute path of a .jsx file to run instead of code."),
+    args: z.record(z.string(), z.unknown()).optional().describe("Arguments: `args` in code, or readArgs() in a skill-style file."),
+    undoName: z.string().optional().describe("Wrap the run in one undo group with this name (for changes)."),
+    timeoutSeconds: z.number().positive().optional().describe("How long to wait for the result (default 60, max 600).")
+  },
+  async (opts) => {
+    try {
+      return bridgeReply(await runJsx(opts));
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running jsx: ${String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "run-skill-script",
+  "Run one of the after-effects skill's scripts (~/.claude/skills/after-effects/scripts) through the panel, with its args. " +
+  "Read-only queries: active-state, project-overview ({mode: 'summary'|'folder'|'full', folderName}), comp-detail ({compName}), " +
+  "layer-detail ({compName, layerNames}), expression-errors ({compName}), font-inventory, project-audit. Others change the project " +
+  "(batch-rename, expression-replace, project-cleanup, … - use dryRun first where they have it). Available now: " +
+  (skillScriptNames().join(', ') || '(skill not found)') + ".",
+  {
+    script: z.string().describe("The script's name without .jsx, e.g. 'project-overview'."),
+    args: z.record(z.string(), z.unknown()).optional().describe("The script's args (what runner.sh would get as JSON)."),
+    timeoutSeconds: z.number().positive().optional().describe("How long to wait (default 60, max 600).")
+  },
+  async ({ script, args, timeoutSeconds }) => {
+    const dir = skillScriptsDir();
+    if (!dir) return { content: [{ type: "text", text: "The after-effects skill's scripts folder isn't there (~/.claude/skills/after-effects/scripts)." }], isError: true };
+    const name = script.replace(/\.jsx$/, '');
+    if (!/^[A-Za-z0-9_-]+$/.test(name) || !fs.existsSync(path.join(dir, name + '.jsx')))
+      return { content: [{ type: "text", text: `No skill script '${name}'. Available: ${skillScriptNames().join(', ')}` }], isError: true };
+    try {
+      return bridgeReply(await runJsx({ file: path.join(dir, name + '.jsx'), args: args || {}, timeoutSeconds }));
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running skill script: ${String(error)}` }], isError: true };
     }
   }
 );
