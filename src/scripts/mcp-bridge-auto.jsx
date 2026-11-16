@@ -2200,23 +2200,50 @@ function updateCommandStatus(status) {
     }
 }
 
-// Every panel update goes through here. Once the panel has been closed its controls are
-// invalid, and touching one raises "Object is invalid" - so after the first failure (or the
-// close handler firing) mcpBridge.uiAlive goes false and the panel is never touched again.
+// Bridge log file: ~/Documents/ae-mcp-bridge/bridge_log.txt. The panel's own log is wiped when
+// the panel is reopened, so anything we need to diagnose later (why the bridge stopped, panel
+// errors, close events) is also written here. Starts fresh once it passes ~500 KB.
+function writeBridgeLog(message) {
+    try {
+        var logFile = new File(new File(getCommandFilePath()).parent.fsName + "/bridge_log.txt");
+        var mode = (logFile.exists && logFile.length > 500000) ? "w" : "a";
+        logFile.encoding = "UTF-8";
+        logFile.open(mode);
+        logFile.writeln(isoNow() + "  " + message);
+        logFile.close();
+    } catch (e) {}
+}
+
+// Every panel update goes through here. A failed update is NOT treated as "the panel is gone":
+// it can fail while the panel is still open (docked behind another tab, workspace switch, AE
+// busy), and the old version used that as a signal to stop polling - which silently killed the
+// bridge. Now a failure only skips that one update and gets written to the log file. Polling is
+// stopped only by the panel's onClose handler.
 function withPanelUI(fn) {
     if (!mcpBridge.uiAlive) return;
     try {
         fn();
+        mcpBridge.uiErrorLogged = false;
     } catch (e) {
-        mcpBridge.uiAlive = false;
+        // Log only the first failure in a row, so a closed docked panel doesn't flood the file.
+        if (!mcpBridge.uiErrorLogged) {
+            mcpBridge.uiErrorLogged = true;
+            writeBridgeLog("Panel update failed (polling continues): " + e.toString());
+        }
     }
 }
+
+// Max characters kept in the panel's log box. Without a cap it grows forever, and a huge
+// edittext gets slow to update.
+var PANEL_LOG_MAX_CHARS = 20000;
 
 // Log message to panel
 function logToPanel(message) {
     withPanelUI(function () {
         var timestamp = new Date().toLocaleTimeString();
-        mcpBridge.logText.text = timestamp + ": " + message + "\n" + mcpBridge.logText.text;
+        var text = timestamp + ": " + message + "\n" + mcpBridge.logText.text;
+        if (text.length > PANEL_LOG_MAX_CHARS) text = text.substring(0, PANEL_LOG_MAX_CHARS);
+        mcpBridge.logText.text = text;
     });
 }
 
@@ -2233,14 +2260,10 @@ function stopCommandChecker() {
     }
 }
 
-// Check for new commands. Runs on a timer, so it reads only plain values (mcpBridge.autoRun,
-// mcpBridge.uiAlive), never the panel's controls - a timer tick after the panel is closed
-// must not touch the closed panel.
+// Check for new commands. Runs on a timer, so it reads only plain values (mcpBridge.autoRun),
+// never the panel's controls directly. It keeps polling even if panel updates fail - only the
+// panel's onClose handler stops it.
 function checkForCommands() {
-    if (!mcpBridge.uiAlive) {
-        stopCommandChecker();
-        return;
-    }
     if (!mcpBridge.autoRun || isChecking) return;
 
     isChecking = true;
@@ -2269,6 +2292,7 @@ function checkForCommands() {
         }
     } catch (e) {
         logToPanel("Error checking for commands: " + e.toString());
+        writeBridgeLog("Error checking for commands: " + e.toString());
     }
 
     isChecking = false;
@@ -2358,11 +2382,12 @@ function buildBridgeUI(thisObj) {
     statusText.text = "Ready - Auto-run is " + (mcpBridge.autoRun ? "ON" : "OFF");
 
     // Closing the panel turns the bridge off. AE doesn't always fire this for a docked panel;
-    // in that case the timer keeps ticking without touching the panel, and the first panel
-    // update that fails (see withPanelUI) turns uiAlive off and stops it on the next tick.
+    // in that case the timer just keeps polling (harmless - panel updates fail quietly, and
+    // reopening the panel cancels the old timer before starting a new one).
     panel.onClose = function () {
         mcpBridge.uiAlive = false;
         stopCommandChecker();
+        writeBridgeLog("Panel closed - bridge stopped polling.");
     };
 
     // Show the panel (docked panels are shown/positioned by AE itself)
@@ -2389,5 +2414,6 @@ if (mcpBridge.reloading) {
     mcpBridge.autoRun = true;
     buildBridgeUI(this);
     startCommandChecker();
+    writeBridgeLog("Bridge started - polling " + getCommandFilePath());
 }
 
