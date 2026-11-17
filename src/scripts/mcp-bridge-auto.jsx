@@ -1991,6 +1991,78 @@ function saveIncrementalVersion(args) {
     });
 }
 
+// --- collectExpressions: everything the MCP server's expression checker needs ---
+// Returns the names of every comp (with its layers, their effects + effect controls, and masks)
+// and footage item, plus every expression (full text, on/off, AE's error) - in the whole project,
+// or only in args.compIndex. Names are always collected for the whole project, because an
+// expression in one comp can point at another comp. The checking itself happens in the server.
+function collectExpressions(args) {
+    var onlyComp = null;
+    if (args.compIndex) {
+        onlyComp = app.project.item(args.compIndex);
+        if (!(onlyComp instanceof CompItem)) throw new Error("Item " + args.compIndex + " is not a composition.");
+    }
+    var out = { projectName: app.project.file ? File.decode(app.project.file.name) : "(unsaved project)", comps: [], footage: [], expressions: [] };
+
+    function scanProperties(group, compName, layerName, layerIndex, path) {
+        for (var i = 1; i <= group.numProperties; i++) {
+            var prop = group.property(i);
+            var here = path ? (path + " > " + prop.name) : prop.name;
+            if (prop.propertyType === PropertyType.PROPERTY) {
+                if (prop.canSetExpression && prop.expression !== "") {
+                    forceExpressionEvaluation(prop);
+                    out.expressions.push({
+                        comp: compName, layer: layerName, layerIndex: layerIndex, property: here,
+                        expression: prop.expression, enabled: prop.expressionEnabled,
+                        error: prop.expressionEnabled ? prop.expressionError : ""
+                    });
+                }
+            } else if (prop.propertyType === PropertyType.INDEXED_GROUP || prop.propertyType === PropertyType.NAMED_GROUP) {
+                scanProperties(prop, compName, layerName, layerIndex, here);
+            }
+        }
+    }
+
+    function childNames(group) {
+        var names = [], matchNames = [];
+        if (group) {
+            for (var i = 1; i <= group.numProperties; i++) {
+                names.push(group.property(i).name);
+                matchNames.push(group.property(i).matchName);
+            }
+        }
+        return { names: names, matchNames: matchNames };
+    }
+
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var item = app.project.item(i);
+        if (item instanceof FootageItem) { out.footage.push(item.name); continue; }
+        if (!(item instanceof CompItem)) continue;
+        var compInfo = { name: item.name, layers: [] };
+        var scanThis = !onlyComp || onlyComp === item;
+        for (var j = 1; j <= item.numLayers; j++) {
+            var layer = item.layer(j);
+            var layerInfo = { index: j, name: layer.name, effects: [], masks: [] };
+            var fx = null, masks = null;
+            try { fx = layer.property("ADBE Effect Parade"); } catch (e1) {}       // cameras/lights have none
+            try { masks = layer.property("ADBE Mask Parade"); } catch (e2) {}
+            if (fx) {
+                for (var k = 1; k <= fx.numProperties; k++) {
+                    var effect = fx.property(k);
+                    var params = childNames(effect);
+                    layerInfo.effects.push({ name: effect.name, matchName: effect.matchName, params: params.names, paramMatchNames: params.matchNames });
+                }
+            }
+            layerInfo.masks = childNames(masks).names;
+            compInfo.layers.push(layerInfo);
+            if (scanThis) scanProperties(layer, item.name, layer.name, j, "");
+        }
+        out.comps.push(compInfo);
+    }
+    out.success = true;
+    return JSON.stringify(out);
+}
+
 // --- setCompositionProperties: set duration, frameRate, etc. on active or named comp ---
 function setCompositionProperties(args) {
     try {
@@ -2300,6 +2372,9 @@ function executeCommand(command, args, commandId) {
                 break;
             case "saveIncrementalVersion":
                 result = saveIncrementalVersion(args);
+                break;
+            case "collectExpressions":
+                result = collectExpressions(args);
                 break;
             case "runJsx":
                 logToPanel("Running jsx" + (args.file ? ": " + args.file : " code") + "...");

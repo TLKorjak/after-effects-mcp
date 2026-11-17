@@ -6,6 +6,7 @@ import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
 import { fileURLToPath } from 'url';
+import { checkExpressions, ProjectData } from "./expressionCheck.js";
 
 // Create an MCP server
 const server = new McpServer({
@@ -426,6 +427,7 @@ Own tools (not run-script):
 - setTextFromCSV: Fill text layers from a CSV (one row, or one duplicate comp per row)
 - addMarkers: Add markers to a comp or a layer
 - saveIncrementalVersion: Save the project as the next version (Name_v01.aep -> Name_v02.aep, test_01.aep -> test_02.aep)
+- checkExpressions: Find expression problems - mainly names that don't match real comps/layers/effects, plus typos and errors
 
 Effect Templates:
 - gaussian-blur: Simple Gaussian blur effect
@@ -861,6 +863,35 @@ server.tool(
       return bridgeReply(await runBridge("saveIncrementalVersion", {}, 120000));
     } catch (error) {
       return { content: [{ type: "text", text: `Error running saveIncrementalVersion: ${String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "checkExpressions",
+  "Scan expressions for problems AE itself often won't show until that line runs - above all, NAMES THAT DON'T MATCH: " +
+  "comp(\"…\"), layer(\"…\"), effect(\"…\"), effect(\"…\")(\"…\"), mask(\"…\") and footage(\"…\") pointing at names that don't exist, " +
+  "with the reason (extra space, capital letters, hidden right-to-left mark, long dash, a layer name used as a comp name, " +
+  "a layer that lives in another comp, a renamed precomp) and the closest real name. Also: duplicate comp/layer names " +
+  "that make a reference ambiguous, variables used but never defined (typos), likely typos after a dot (.positon), " +
+  "unused variables, syntax errors, AE's own expression errors, and expressions AE switched off. " +
+  "Scans the whole project, or one comp with compName / compIndex. Read-only.",
+  {
+    ...CompIdentifierSchema,
+    minSeverity: z.enum(["error", "warning", "info"]).optional().describe("Leave out less serious issues: 'error' = only real problems, 'warning' = also likely problems. Default 'info' (everything)."),
+    maxIssues: z.number().int().positive().optional().describe("Most issues to list (default 200; errors come first).")
+  },
+  async ({ compIndex, compName, minSeverity, maxIssues }) => {
+    try {
+      // Every expression is evaluated once to read AE's error, so big projects take a while
+      const raw = await runBridge("collectExpressions", { compIndex, compName }, 300000);
+      let data: ProjectData & { success?: boolean };
+      try { data = JSON.parse(raw); } catch { return bridgeReply(raw); }
+      if (!data.success || !Array.isArray(data.expressions)) return bridgeReply(raw);
+      const report = checkExpressions(data, { minSeverity, maxIssues });
+      return { content: [{ type: "text" as const, text: JSON.stringify(report, null, 1) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error running checkExpressions: ${String(error)}` }], isError: true };
     }
   }
 );
